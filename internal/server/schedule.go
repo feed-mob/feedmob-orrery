@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -179,5 +180,83 @@ func (s *Server) RunPruner(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+	}
+}
+
+// chainWorkflowRun starts the workflows that wait on this one finishing.
+//
+// `on: workflow_run` is how a repository splits "build" from "deploy" without
+// making one workflow that does both — and the split is the point: the deploy
+// can have different permissions, a different concurrency group and a different
+// approval story from the build that produced the artefact.
+//
+// Runs from this path are themselves `workflow_run` events, but they do not
+// chain further: a workflow that fires on its own downstream is a loop, and one
+// hop is what GitHub allows too.
+func (s *Server) chainWorkflowRun(ctx context.Context, upstream *store.Run) {
+	if upstream == nil || upstream.Event == "workflow_run" {
+		return
+	}
+	if !s.repoAllowed(upstream.Repo) {
+		return
+	}
+	files, err := s.forge.Workflows(ctx, upstream.Repo, upstream.SHA)
+	if err != nil {
+		s.log.Error("cannot read workflows to chain from", "run", upstream.ID, "err", err)
+		return
+	}
+	ev := workflow.Event{
+		Name:       "workflow_run",
+		Ref:        upstream.Ref,
+		Workflow:   upstream.WorkflowName,
+		Conclusion: upstream.Result,
+		Action:     "completed",
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"action": "completed",
+		"workflow_run": map[string]any{
+			"id": upstream.ID, "name": upstream.WorkflowName,
+			"conclusion": upstream.Result, "head_sha": upstream.SHA,
+			"head_branch": strings.TrimPrefix(upstream.Ref, "refs/heads/"),
+			"event":       upstream.Event,
+		},
+		"repository": map[string]any{"full_name": upstream.Repo},
+	})
+
+	for _, f := range files {
+		wf, err := workflow.Parse(f.Content)
+		if err != nil {
+			continue
+		}
+		// Never chain a workflow off itself, however it is written.
+		if f.Path == upstream.WorkflowFile {
+			continue
+		}
+		if _, ok, err := wf.Matches(ev); err != nil || !ok {
+			continue
+		}
+		jobs, err := newJobsFor(wf, f.Content)
+		if err != nil {
+			s.log.Error("cannot build the chained run", "file", f.Path, "err", err)
+			continue
+		}
+		run := store.Run{
+			Repo: upstream.Repo, WorkflowName: wf.Name, WorkflowFile: f.Path,
+			Event: "workflow_run", Ref: upstream.Ref, SHA: upstream.SHA,
+			Actor: upstream.Actor, EventPayload: string(payload),
+		}
+		if err := s.applyConcurrency(wf, &run); err != nil {
+			s.log.Error("cannot apply concurrency to the chained run", "file", f.Path, "err", err)
+			continue
+		}
+		id, err := s.st.CreateRun(ctx, run, jobs)
+		if err != nil {
+			s.log.Error("cannot create the chained run", "file", f.Path, "err", err)
+			continue
+		}
+		s.wake.broadcast()
+		s.reportStatus(&run, forge.StatePending, fmt.Sprintf("%d job(s) queued", len(jobs)))
+		s.log.Info("chained a run", "from", upstream.ID, "to", id,
+			"workflow", wf.Name, "conclusion", upstream.Result)
 	}
 }

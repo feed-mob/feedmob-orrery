@@ -17,6 +17,10 @@ type Event struct {
 	BaseRef string
 	// Action is the activity type: opened, synchronize, closed, …
 	Action string
+	// Workflow is the upstream workflow's name, for `on: workflow_run`.
+	Workflow string
+	// Conclusion is how that upstream run ended — success, failure, cancelled.
+	Conclusion string
 	// Paths are the files the event touched, for paths/paths-ignore.
 	Paths []string
 }
@@ -33,6 +37,10 @@ type Trigger struct {
 	PathsIgnore    []string
 	Types          []string
 	Cron           []string
+	// Workflows is `workflow_run.workflows` — which upstream workflows this one
+	// chains off. Required: an unnamed upstream would chain this workflow off
+	// every workflow in the repository, itself included.
+	Workflows []string
 }
 
 // defaultTypes are the activity types GitHub assumes when `types:` is absent.
@@ -44,6 +52,10 @@ var defaultTypes = map[string][]string{
 	"issues":              {"opened", "edited", "deleted", "transferred", "pinned", "unpinned", "closed", "reopened", "assigned", "unassigned", "labeled", "unlabeled", "locked", "unlocked", "milestoned", "demilestoned"},
 	"issue_comment":       {"created", "edited", "deleted"},
 	"release":             {"published", "unpublished", "created", "edited", "deleted", "prereleased", "released"},
+	// workflow_run's types are the upstream's conclusion. GitHub's default is
+	// `completed`, which means any of them — a deploy chained off a build will
+	// also fire when that build failed unless the author says otherwise.
+	"workflow_run": {"completed"},
 }
 
 // Triggers reads `on:` in all three shapes GitHub accepts: a bare string, a
@@ -86,6 +98,7 @@ func triggersFromMap(m map[string]any) ([]Trigger, error) {
 			t.Paths = stringsOf(f["paths"])
 			t.PathsIgnore = stringsOf(f["paths-ignore"])
 			t.Types = stringsOf(f["types"])
+			t.Workflows = stringsOf(f["workflows"])
 		case []any:
 			// `on: {schedule: [{cron: …}]}`
 			for _, item := range f {
@@ -110,6 +123,12 @@ func triggersFromMap(m map[string]any) ([]Trigger, error) {
 // dropping the other is how a workflow ends up running on refs its author
 // believed were excluded.
 func (t *Trigger) validate() error {
+	// An unnamed upstream would chain this workflow off every workflow in the
+	// repository — including itself, which is a loop nobody meant to write.
+	if t.Event == "workflow_run" && len(t.Workflows) == 0 {
+		return fmt.Errorf("on.workflow_run: needs `workflows:`; without it every " +
+			"workflow in the repository would chain into this one, including itself")
+	}
 	for _, pair := range []struct {
 		a, b   []string
 		an, bn string
@@ -163,6 +182,9 @@ func (t *Trigger) Matches(ev Event) bool {
 	if t.Event != ev.Name {
 		return false
 	}
+	if t.Event == "workflow_run" && !t.upstreamMatches(ev) {
+		return false
+	}
 	if !t.typeMatches(ev) {
 		return false
 	}
@@ -172,7 +194,33 @@ func (t *Trigger) Matches(ev Event) bool {
 	return t.pathMatches(ev)
 }
 
+// upstreamMatches applies `workflows:` and the conclusion filter.
+//
+// `types:` on workflow_run names the upstream's conclusion rather than an
+// activity type, and GitHub's default `completed` means any of them — so a
+// deploy chained off a build fires even when that build failed, unless the
+// author writes `types: [success]`. Worth knowing before wiring a deploy to it.
+func (t *Trigger) upstreamMatches(ev Event) bool {
+	if !matchAny(t.Workflows, ev.Workflow) {
+		return false
+	}
+	want := t.Types
+	if len(want) == 0 {
+		want = defaultTypes["workflow_run"]
+	}
+	for _, w := range want {
+		if w == "completed" || w == ev.Conclusion {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Trigger) typeMatches(ev Event) bool {
+	// workflow_run's types are conclusions; upstreamMatches handled them.
+	if t.Event == "workflow_run" {
+		return true
+	}
 	if ev.Action == "" {
 		return true
 	}

@@ -605,3 +605,92 @@ func TestEventWithNothingToReadFromIsIgnored(t *testing.T) {
 		t.Errorf("created %d runs with nothing to read a workflow from", len(runs))
 	}
 }
+
+const chainWorkflows = `
+name: Deploy After Build
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [success]
+jobs:
+  deploy:
+    runs-on: [self-hosted]
+    steps:
+      - run: echo deploy
+`
+
+// `on: workflow_run` is how build and deploy stay separate workflows with
+// different permissions and concurrency, instead of one that does both.
+func TestWorkflowRunChainsOffASettledRun(t *testing.T) {
+	// The fake forge serves both files: the CI workflow that ran, and the one
+	// waiting on it.
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/contents/.github/workflows") {
+			_ = json.NewEncoder(w).Encode([]map[string]string{
+				{"name": "ci.yml", "path": ".github/workflows/ci.yml", "type": "file"},
+				{"name": "deploy.yml", "path": ".github/workflows/deploy.yml", "type": "file"},
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/commits/") {
+			_, _ = io.WriteString(w, "beefcafebeefcafebeefcafebeefcafebeefcafe")
+			return
+		}
+		if strings.Contains(r.URL.Path, "deploy.yml") {
+			_, _ = io.WriteString(w, chainWorkflows)
+			return
+		}
+		_, _ = io.WriteString(w, ciWorkflow)
+	}))
+	defer gh.Close()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "chain.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	srv := New(st, Config{
+		RegistrationToken: regToken, FetchHold: 50 * time.Millisecond,
+		Forge: Forge{URL: "https://github.com", APIURL: gh.URL}, ForgeToken: "t",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// A settled CI run.
+	runID, err := st.CreateRun(t.Context(), store.Run{
+		Repo: "feed-mob/app", WorkflowName: "CI", WorkflowFile: ".github/workflows/ci.yml",
+		Event: "push", Ref: "refs/heads/main", SHA: "abc123", Actor: "someone",
+	}, []store.NewJob{{Key: "build", Payload: "p"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sum, _ := st.RunByID(t.Context(), runID)
+	if _, err := st.FinishJob(t.Context(), sum.Jobs[0].ID, "success"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	meta, _ := st.RunMeta(t.Context(), runID)
+
+	srv.chainWorkflowRun(t.Context(), meta)
+
+	runs, _ := st.ListRuns(t.Context(), 10)
+	var chained *store.Run
+	for i := range runs {
+		if runs[i].Event == "workflow_run" {
+			chained = &runs[i]
+		}
+	}
+	if chained == nil {
+		t.Fatalf("nothing chained off a successful CI run; runs = %+v", runs)
+	}
+	if chained.WorkflowName != "Deploy After Build" || chained.SHA != "abc123" {
+		t.Errorf("chained run = %+v", chained)
+	}
+
+	// A chained run must not chain again: a workflow firing on its own
+	// downstream is a loop.
+	chainedMeta, _ := st.RunMeta(t.Context(), chained.ID)
+	before, _ := st.ListRuns(t.Context(), 50)
+	srv.chainWorkflowRun(t.Context(), chainedMeta)
+	after, _ := st.ListRuns(t.Context(), 50)
+	if len(after) != len(before) {
+		t.Errorf("a workflow_run run chained further: %d -> %d", len(before), len(after))
+	}
+}

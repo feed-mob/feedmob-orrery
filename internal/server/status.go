@@ -137,6 +137,14 @@ func (s *Server) announce(ctx context.Context, outcome *store.RunOutcome) {
 	state, desc := statusFor(outcome.Result)
 	s.reportStatus(run, state, desc)
 	s.notifyIfChanged(ctx, run)
+	// Detached: chaining reads workflows from the forge, and the caller here is
+	// a runner reporting a finished task. It should not wait on a network call
+	// to somebody else's API to get its own response.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		s.chainWorkflowRun(ctx, run)
+	}()
 }
 
 // applyConcurrency resolves the run's concurrency group.

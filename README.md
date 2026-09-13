@@ -166,6 +166,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **仓库白名单** | ✅ `-repos`；签名不等于"这个仓库归我们管" |
 | **API / UI 认证** | ✅ 无 token 拒绝启动；bearer / HttpOnly 会话 cookie；webhook 走签名、healthz 开放 |
 | **Web UI**（#32） | ✅ 编译进二进制，无 CDN；run 列表、步骤时间线、日志、重跑、停止；深色与手机适配 |
+| **`workflow_run` 链式触发**（#37） | ✅ 一个 workflow 落定后触发另一个；只跳一跳，不会成环 |
 | **自动重试**（#66） | ✅ job 级 `retry:`，指数退避；GitHub 完全没有这个 |
 | **重跑**（#53） | ✅ `rerun [--failed]`：run 保持不变、attempt +1；成功 job 的产物与 outputs 留着给被重跑的用 |
 | `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
@@ -317,6 +318,30 @@ GitHub App，再升级到 Checks API 拿 diff 行内注解。
 那几行，不是每两秒把整份日志重新拉一遍。渲染上限 5000 行，超出给「纯文本」链接。
 
 只在有东西真的在动的时候才轮询——没人看的时候还在敲自己控制面的面板，本身就是一次故障。
+
+### `workflow_run`：build 和 deploy 分开
+
+```yaml
+# deploy.yml
+on:
+  workflow_run:
+    workflows: [CI]      # 必填
+    types: [success]     # 不写的话默认 completed，失败也会触发
+```
+
+这是仓库把 build 和 deploy 拆成两个 workflow 的办法，而拆开本身就是目的：deploy
+可以有和 build 不同的权限、不同的并发组、不同的审批。
+
+两条和 GitHub 不一样的地方，都是有意的：
+
+- **`workflows:` 必填。** 不写等于"仓库里任何 workflow 跑完都触发我"，包括它自己——
+  一个没人打算写的环。GitHub 允许不写，我们在解析时就拒。
+- **只跳一跳。** `workflow_run` 起来的 run 不会再触发下一层。
+
+`types:` 在这里指的是**上游的结论**（success / failure / cancelled），不是活动类型。
+GitHub 的默认值 `completed` 意思是"任何结论"——所以一个挂在 build 后面的 deploy，
+在 build 失败时**照样会跑**，除非你写 `types: [success]`。这条我们原样复刻了，
+但值得在把 deploy 接上去之前知道。
 
 ### 自动重试
 

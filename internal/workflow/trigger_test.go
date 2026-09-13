@@ -169,3 +169,56 @@ func TestNegatedPatterns(t *testing.T) {
 		t.Error("the negation should have removed releases/v1-rc")
 	}
 }
+
+// `on: workflow_run` is how a repository splits build from deploy without
+// making one workflow that does both.
+func TestWorkflowRunMatching(t *testing.T) {
+	wf := mustParse(t, `
+name: Deploy
+on:
+  workflow_run:
+    workflows: [Build]
+    types: [success]
+jobs:
+  a:
+    steps:
+      - run: x
+`)
+	check := func(upstream, conclusion string, want bool) {
+		t.Helper()
+		_, ok, err := wf.Matches(Event{Name: "workflow_run", Workflow: upstream, Conclusion: conclusion})
+		if err != nil {
+			t.Fatalf("Matches: %v", err)
+		}
+		if ok != want {
+			t.Errorf("upstream=%q conclusion=%q matched=%v, want %v", upstream, conclusion, ok, want)
+		}
+	}
+	check("Build", "success", true)
+	check("Build", "failure", false)
+	check("Build", "cancelled", false)
+	// A different upstream is a different story.
+	check("Lint", "success", false)
+}
+
+// GitHub's default is `completed`, which means any conclusion — so a deploy
+// chained off a build also fires when that build failed. Worth reproducing
+// faithfully, and worth knowing before wiring a deploy to it.
+func TestWorkflowRunDefaultTypeIsAnyConclusion(t *testing.T) {
+	wf := mustParse(t, "name: w\non:\n  workflow_run:\n    workflows: [Build]\njobs:\n  a:\n    steps:\n      - run: x\n")
+	for _, conclusion := range []string{"success", "failure", "cancelled"} {
+		_, ok, err := wf.Matches(Event{Name: "workflow_run", Workflow: "Build", Conclusion: conclusion})
+		if err != nil || !ok {
+			t.Errorf("conclusion %q: ok=%v err=%v; GitHub's default fires on all of them", conclusion, ok, err)
+		}
+	}
+}
+
+// An unnamed upstream would chain this workflow off every workflow in the
+// repository, itself included.
+func TestWorkflowRunRequiresWorkflows(t *testing.T) {
+	src := "name: w\non:\n  workflow_run:\n    types: [success]\njobs:\n  a:\n    steps:\n      - run: x\n"
+	if _, err := mustParse(t, src).Triggers(); err == nil {
+		t.Fatal("on.workflow_run without `workflows:` was accepted")
+	}
+}
