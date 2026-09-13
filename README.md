@@ -79,6 +79,22 @@ Orrery 读得懂现有的 workflow 文件，但底下是我们自己的引擎。
 
 ---
 
+## 竞品调研结论（2026-09-12）
+
+55 个产品、19 维、158 张优点卡、14 块墓碑。完整见 [`research/competitor-collection.md`](research/competitor-collection.md)，证据台账 [`research/claims.jsonl`](research/claims.jsonl)。
+
+**三条改变章程的发现：**
+
+1. **`nektos/act` 已停更，且按设计没有编排层。** master 自 2026-06-01 零提交；`concurrency`/`timeout-minutes`/`permissions`/取消/annotation 全部 "ignored"。兼容 GitHub Actions 天然分两半——runner 侧（步骤执行）与服务端侧（并发、超时、取消、审批），**而服务端侧恰好是我们全部四个痛点的所在**。正确的 fork 目标是 `gitea/runner` 的 `act/` 目录（MIT，两周内发了五个版本）。
+
+2. **55 个产品里只有 8 个通过 agent-first 五问**，且 durable execution / 工作流自动化 / 部署三个品类的领头羊**全部不通过**。agent 治理这一层没有现成占位者。
+
+3. **墓碑指向同一个结论**：Orrery 应是 GitHub Actions 之上的**治理与确定性层**，不是它的替代品。Earthly CI 死于迁移成本墙；Drone、Codefresh 被套件吃掉；BuildJet 被平台原生化挤死。判断标准：**如果这个功能写在 GitHub 的 roadmap 上是合理的，Orrery 就不该建它。**
+
+**新增硬约束**（来自 Airplane.dev 那块碑）：**Orrery 挂掉时，8 个仓库必须仍能用原生 GitHub Actions 部署。**
+
+---
+
 ## 仓库结构
 
 ```
