@@ -37,6 +37,8 @@ func main() {
 			"token every human-facing API call and the dashboard must present")
 		noAuth = flag.Bool("insecure-no-auth", false,
 			"serve the API and dashboard with no authentication; anyone who can reach the port can run arbitrary workflows with this server's secrets")
+		repos = flag.String("repos", os.Getenv("ORRERY_REPOS"),
+			"comma-separated owner/repo this server will build; empty means any repository a signed webhook names")
 		notifyHook = flag.String("notify-webhook", os.Getenv("ORRERY_NOTIFY_WEBHOOK"),
 			"chat webhook that receives a message when a workflow's verdict changes (Slack-shaped {\"text\"}); only changes are sent, not every run")
 		defaultConc = flag.String("default-concurrency", "${{ github.workflow }}@${{ github.ref }}",
@@ -107,6 +109,7 @@ func main() {
 		DefaultConcurrency: *defaultConc,
 		NotifyWebhook:      *notifyHook,
 		APIToken:           *apiToken,
+		Repos:              splitList(*repos),
 	}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -142,6 +145,10 @@ func main() {
 	}
 	if *forgeToken == "" {
 		log.Warn("no forge token: results will not be reported back to the forge")
+	}
+	if *repos == "" {
+		log.Warn("no -repos list: any repository a signed webhook names will be built with this " +
+			"server's secrets; every repo pointing here shares the webhook secret")
 	}
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("serve", "err", err)
@@ -183,6 +190,16 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+func splitList(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envWithPrefix(prefix string) map[string]string {

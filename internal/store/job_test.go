@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -276,5 +277,62 @@ func TestOverdueReportsATimeoutOnlyUntilItAsksForAStop(t *testing.T) {
 	}
 	if len(due) != 1 || due[0].Reason != "stop_unacked" {
 		t.Fatalf("after the grace period = %+v, want stop_unacked", due)
+	}
+}
+
+// A job that prints without stopping would otherwise fill the disk and take the
+// control plane down with it.
+func TestAppendLogsStopsAtTheCap(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	st.SetMaxLogBytes(500)
+	r := newRunner(t, st, []string{"self-hosted"}, nil)
+
+	runID, err := st.CreateRun(ctx, Run{Repo: "r", WorkflowName: "w"},
+		[]NewJob{{Key: "noisy", Payload: "p", RunsOn: []string{"self-hosted"}}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_ = runID
+	job, err := st.ClaimJob(ctx, r)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	line := strings.Repeat("x", 100)
+	var index int64
+	for i := 0; i < 20; i++ {
+		ack, err := st.AppendLogs(ctx, job.ID, index, []LogLine{{Time: st.now(), Content: line}}, false)
+		if err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		// Past the cap the lines must be acked, not refused: refusing would make
+		// the runner resend them forever and turn a noisy job into a hot loop.
+		if ack != index+1 {
+			t.Fatalf("append %d: ack = %d, want %d — the runner would resend forever", i, ack, index+1)
+		}
+		index = ack
+	}
+
+	lines, err := st.Logs(ctx, job.ID, nil)
+	if err != nil {
+		t.Fatalf("logs: %v", err)
+	}
+	if len(lines) >= 20 {
+		t.Fatalf("stored %d lines; the cap did nothing", len(lines))
+	}
+	last := lines[len(lines)-1].Content
+	if !strings.Contains(last, "上限") {
+		t.Errorf("the truncation is silent; last line = %q", last)
+	}
+	// Exactly one notice, however many further lines arrive.
+	notices := 0
+	for _, l := range lines {
+		if strings.Contains(l.Content, "上限") {
+			notices++
+		}
+	}
+	if notices != 1 {
+		t.Errorf("got %d truncation notices, want 1", notices)
 	}
 }

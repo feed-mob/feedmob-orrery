@@ -138,6 +138,16 @@ func (s *Server) dispatchEvent(ctx context.Context, event string, body []byte) (
 	if p.Repository.FullName == "" {
 		return nil, fmt.Errorf("%s payload names no repository", event)
 	}
+	// The signature proves the sender knows the shared secret, not that the
+	// repository it names is one we build. Every repo pointing at this server
+	// shares that secret, so without a list any of them — or anyone the secret
+	// leaks to — could name someone else's repository and have us read its
+	// workflows with our forge token and run them with our deploy secrets.
+	if !s.repoAllowed(p.Repository.FullName) {
+		s.log.Warn("refused a signed delivery for a repository that is not on the list",
+			"repo", p.Repository.FullName, "event", event)
+		return nil, fmt.Errorf("repository %q is not in -repos", p.Repository.FullName)
+	}
 	// A branch deletion carries the all-zero sha: there is no tree to read a
 	// workflow from, and nothing to build.
 	if event == "push" && (p.After == "" || strings.Trim(p.After, "0") == "") {
@@ -282,6 +292,10 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Repo == "" || req.WorkflowFile == "" {
 		writeErr(w, http.StatusBadRequest, "repo and workflow_file are required")
+		return
+	}
+	if !s.repoAllowed(req.Repo) {
+		writeErr(w, http.StatusForbidden, fmt.Sprintf("repository %q is not in -repos", req.Repo))
 		return
 	}
 	ref := req.Ref

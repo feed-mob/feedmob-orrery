@@ -351,7 +351,9 @@ func (s *Store) AppendLogs(ctx context.Context, jobID, index int64, rows []LogLi
 	defer tx.Rollback()
 
 	var ack int64
-	err = tx.QueryRowContext(ctx, `SELECT ack_index FROM job_log_state WHERE job_id = ?`, jobID).Scan(&ack)
+	var truncatedFlag int
+	err = tx.QueryRowContext(ctx,
+		`SELECT ack_index, truncated FROM job_log_state WHERE job_id = ?`, jobID).Scan(&ack, &truncatedFlag)
 	if errors.Is(err, sql.ErrNoRows) {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO job_log_state (job_id, ack_index) VALUES (?, 0)`, jobID); err != nil {
 			return 0, err
@@ -365,11 +367,41 @@ func (s *Store) AppendLogs(ctx context.Context, jobID, index int64, rows []LogLi
 		// The runner skipped ahead; refuse and let it resend from ack.
 		return ack, nil
 	}
+
+	// A job that prints without stopping would otherwise fill the disk and take
+	// the control plane down with it. Past the cap the lines are acked and
+	// dropped rather than refused: refusing would make the runner resend the
+	// same lines forever and turn a noisy job into a hot loop.
+	var stored int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(LENGTH(content)), 0) FROM job_logs
+		WHERE job_id = ? AND attempt = (SELECT attempt FROM jobs WHERE id = ?)`,
+		jobID, jobID).Scan(&stored); err != nil {
+		return 0, err
+	}
+	truncated := truncatedFlag == 1
+
 	for i, row := range rows {
 		at := index + int64(i)
 		if at < ack {
 			continue
 		}
+		if stored > s.maxLogBytes {
+			if !truncated {
+				truncated = true
+				if _, err := tx.ExecContext(ctx, `
+					INSERT INTO job_logs (job_id, attempt, idx, ts, content)
+					VALUES (?, (SELECT attempt FROM jobs WHERE id = ?), ?, ?, ?)
+					ON CONFLICT (job_id, attempt, idx) DO NOTHING`,
+					jobID, jobID, at, ts(row.Time),
+					fmt.Sprintf("::orrery:: 日志超过 %d 字节上限，后续行不再保存", s.maxLogBytes)); err != nil {
+					return 0, err
+				}
+			}
+			ack = at + 1
+			continue
+		}
+		stored += int64(len(row.Content))
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO job_logs (job_id, attempt, idx, ts, content)
 			VALUES (?, (SELECT attempt FROM jobs WHERE id = ?), ?, ?, ?)
@@ -380,8 +412,8 @@ func (s *Store) AppendLogs(ctx context.Context, jobID, index int64, rows []LogLi
 		ack = at + 1
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE job_log_state SET ack_index = ?, no_more = ? WHERE job_id = ?`,
-		ack, boolInt(noMore), jobID); err != nil {
+		UPDATE job_log_state SET ack_index = ?, no_more = ?, truncated = ? WHERE job_id = ?`,
+		ack, boolInt(noMore), boolInt(truncated), jobID); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {

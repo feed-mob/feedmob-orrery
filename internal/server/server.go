@@ -67,6 +67,8 @@ type Config struct {
 	// otherwise, because an open port here is arbitrary code execution with
 	// this server's secrets attached.
 	APIToken string
+	// Repos limits which repositories this server will build. Empty means all.
+	Repos []string
 	// NotifyWebhook receives a message when a workflow's verdict changes.
 	// Slack-shaped {"text": …}, which Mattermost and Discord also accept.
 	NotifyWebhook string

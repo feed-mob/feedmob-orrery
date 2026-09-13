@@ -157,3 +157,24 @@ func TestHealthzStaysOpen(t *testing.T) {
 		t.Errorf("healthz = %d; a load balancer cannot present a token", res.StatusCode)
 	}
 }
+
+// A signature proves the sender knows the shared secret, not that the
+// repository it names is one we build. Every repo pointing at this server
+// shares that secret.
+func TestRepoAllowlist(t *testing.T) {
+	s := &Server{cfg: Config{}}
+	if !s.repoAllowed("anyone/anything") {
+		t.Error("an empty list should allow everything")
+	}
+	s.cfg.Repos = []string{"feed-mob/app", " feed-mob/Orrery "}
+	if !s.repoAllowed("feed-mob/app") {
+		t.Error("a listed repo was refused")
+	}
+	// Whitespace in a comma-separated flag is the operator's, not a decision.
+	if !s.repoAllowed("feed-mob/orrery") {
+		t.Error("matching should ignore surrounding space and case, as GitHub does")
+	}
+	if s.repoAllowed("attacker/evil") {
+		t.Error("an unlisted repo was accepted; a leaked webhook secret would run its workflows")
+	}
+}

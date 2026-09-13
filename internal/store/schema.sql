@@ -145,7 +145,10 @@ CREATE TABLE IF NOT EXISTS job_logs (
 CREATE TABLE IF NOT EXISTS job_log_state (
     job_id    INTEGER PRIMARY KEY REFERENCES jobs (id) ON DELETE CASCADE,
     ack_index INTEGER NOT NULL DEFAULT 0,
-    no_more   INTEGER NOT NULL DEFAULT 0
+    no_more   INTEGER NOT NULL DEFAULT 0,
+    -- Set once this attempt's log hit the size cap, so the notice is written
+    -- once rather than on every submission that arrives afterwards.
+    truncated INTEGER NOT NULL DEFAULT 0
 );
 
 -- Webhook deliveries we have already acted on.

@@ -96,3 +96,20 @@ func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 		"authorized":    s.cfg.APIToken == "" || s.authorized(r),
 	})
 }
+
+// repoAllowed reports whether we build this repository at all.
+//
+// An empty list means every repository, which is the right default for a
+// single-team server and the wrong one the moment the webhook secret is shared
+// more widely than the people who own the repos. main warns when it is empty.
+func (s *Server) repoAllowed(repo string) bool {
+	if len(s.cfg.Repos) == 0 {
+		return true
+	}
+	for _, r := range s.cfg.Repos {
+		if strings.EqualFold(strings.TrimSpace(r), repo) {
+			return true
+		}
+	}
+	return false
+}

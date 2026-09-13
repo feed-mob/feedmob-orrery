@@ -123,7 +123,8 @@ func (s *Store) Rerun(ctx context.Context, runID int64, failedOnly bool) (int, e
 		// The new attempt's log stream starts at 0 again; the previous one is
 		// kept under its own attempt.
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE job_log_state SET ack_index = 0, no_more = 0 WHERE job_id = ?`, j.id); err != nil {
+			`UPDATE job_log_state SET ack_index = 0, no_more = 0, truncated = 0 WHERE job_id = ?`,
+			j.id); err != nil {
 			return 0, err
 		}
 		// Outputs of a job about to run again are stale. Outputs of the jobs

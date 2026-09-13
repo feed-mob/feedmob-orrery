@@ -32,6 +32,10 @@ type Store struct {
 	// gate decides whether a blocked job runs once its upstreams settle. nil
 	// means the default: run iff every upstream succeeded.
 	gate JobGate
+	// maxLogBytes caps what one attempt of one job may store. A job that prints
+	// without stopping would otherwise fill the disk and take the control plane
+	// with it.
+	maxLogBytes int64
 }
 
 // Open opens (and migrates) the database at path.
@@ -53,7 +57,19 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return &Store{db: db, now: time.Now}, nil
+	return &Store{db: db, now: time.Now, maxLogBytes: DefaultMaxLogBytes}, nil
+}
+
+// DefaultMaxLogBytes is how much one attempt of one job may store. GitHub's own
+// limit is in the same order; the number matters less than having one.
+const DefaultMaxLogBytes = 64 << 20
+
+// SetMaxLogBytes overrides the cap. Zero or less restores the default.
+func (s *Store) SetMaxLogBytes(n int64) {
+	if n <= 0 {
+		n = DefaultMaxLogBytes
+	}
+	s.maxLogBytes = n
 }
 
 // UseJobGate installs the `if:` policy. Called once at startup, before any run
@@ -73,6 +89,7 @@ func addColumns(db *sql.DB) error {
 		`ALTER TABLE runs ADD COLUMN cancel_in_progress INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE runs ADD COLUMN run_attempt INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE job_log_state ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("%s: %w", stmt, err)
