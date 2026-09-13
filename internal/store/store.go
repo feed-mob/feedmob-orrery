@@ -94,6 +94,10 @@ func addColumns(db *sql.DB) error {
 		`ALTER TABLE jobs ADD COLUMN retry_backoff INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN retry_on TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE jobs ADD COLUMN retry_after TEXT`,
+		`ALTER TABLE jobs ADD COLUMN environment TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE jobs ADD COLUMN environment_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE jobs ADD COLUMN auto_rollback INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN version_from TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("%s: %w", stmt, err)
@@ -358,6 +362,11 @@ type NewJob struct {
 	RetryMax     int
 	RetryBackoff int
 	RetryOn      []string
+	// Environment set marks this job as a deployment.
+	Environment    string
+	EnvironmentURL string
+	AutoRollback   bool
+	VersionFrom    string
 }
 
 // Run is a stored workflow run.
@@ -474,10 +483,12 @@ func (s *Store) CreateRun(ctx context.Context, run Run, jobs []NewJob) (int64, e
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO jobs (run_id, job_key, name, needs, runs_on, payload, status, timeout_minutes, created_at,
-			                  retry_max, retry_backoff, retry_on)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			                  retry_max, retry_backoff, retry_on,
+			                  environment, environment_url, auto_rollback, version_from)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			runID, j.Key, j.Name, encodeJSON(j.Needs), encodeJSON(j.RunsOn), j.Payload, status, timeout, now,
-			max(j.RetryMax, 1), j.RetryBackoff, encodeJSON(j.RetryOn)); err != nil {
+			max(j.RetryMax, 1), j.RetryBackoff, encodeJSON(j.RetryOn),
+			j.Environment, j.EnvironmentURL, boolInt(j.AutoRollback), j.VersionFrom); err != nil {
 			return 0, fmt.Errorf("insert job %s: %w", j.Key, err)
 		}
 	}

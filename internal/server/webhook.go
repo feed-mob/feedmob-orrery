@@ -357,22 +357,6 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobs, err := newJobsFor(wf, file.Content)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	// GitHub puts the values under github.event.inputs, as strings, and both
-	// `github.event.inputs.*` and the newer `inputs.*` are read from there.
-	payload, err := json.Marshal(map[string]any{
-		"inputs":   inputs,
-		"ref":      ref,
-		"workflow": file.Path,
-	})
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	// Resolve the ref to a commit. A dispatched run otherwise has no
 	// `github.sha`: actions/checkout copes by using the ref, but a reusable
 	// workflow resolves as `owner/repo/path@sha` and fails with "reference not
@@ -382,25 +366,53 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("cannot resolve %s@%s: %v", req.Repo, ref, err))
 		return
 	}
-	run := store.Run{
-		Repo: req.Repo, WorkflowName: wf.Name, WorkflowFile: file.Path,
-		Event: "workflow_dispatch", Ref: refName(ref), SHA: sha,
-		Actor:        orDefault(req.Actor, "api"),
-		EventPayload: string(payload),
-	}
-	if err := s.applyConcurrency(wf, &run); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	runID, err := s.st.CreateRun(ctx, run, jobs)
+	runID, err := s.startDispatch(ctx, req.Repo, file, wf, sha, ref, orDefault(req.Actor, "api"), inputs)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.wake.broadcast()
-	s.log.Info("workflow dispatched", "run", runID, "repo", req.Repo,
-		"workflow", file.Path, "ref", ref, "inputs", inputNames(inputs))
 	writeJSON(w, http.StatusOK, SubmitResponse{RunID: runID, Jobs: wf.JobOrder})
+}
+
+// startDispatch creates the run a workflow_dispatch produces.
+//
+// Shared with rollback, which is a dispatch of the workflow that deployed the
+// last good version — same path, so a rolled-back deployment is recorded and
+// reported exactly like any other.
+func (s *Server) startDispatch(ctx context.Context, repo string, file *forge.File,
+	wf *workflow.Workflow, sha, ref, actor string, inputs map[string]string) (int64, error) {
+	jobs, err := newJobsFor(wf, file.Content)
+	if err != nil {
+		return 0, err
+	}
+	// GitHub puts the values under github.event.inputs, as strings, and both
+	// `github.event.inputs.*` and the newer `inputs.*` are read from there.
+	payload, err := json.Marshal(map[string]any{
+		"inputs":   inputs,
+		"ref":      ref,
+		"workflow": file.Path,
+	})
+	if err != nil {
+		return 0, err
+	}
+	run := store.Run{
+		Repo: repo, WorkflowName: wf.Name, WorkflowFile: file.Path,
+		Event: "workflow_dispatch", Ref: refName(ref), SHA: sha,
+		Actor: actor, EventPayload: string(payload),
+	}
+	if err := s.applyConcurrency(wf, &run); err != nil {
+		return 0, err
+	}
+	runID, err := s.st.CreateRun(ctx, run, jobs)
+	if err != nil {
+		return 0, err
+	}
+	s.wake.broadcast()
+	run.ID = runID
+	s.reportStatus(&run, forge.StatePending, fmt.Sprintf("%d job(s) queued", len(jobs)))
+	s.log.Info("workflow dispatched", "run", runID, "repo", repo,
+		"workflow", file.Path, "ref", ref, "actor", actor, "inputs", inputNames(inputs))
+	return runID, nil
 }
 
 // inputNames logs which inputs were supplied without logging their values: a

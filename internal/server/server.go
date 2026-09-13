@@ -185,6 +185,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/workflows", s.operator(s.handleWorkflowsOf))
 	s.mux.HandleFunc("GET /api/config", s.operator(s.handleConfig))
 	s.mux.HandleFunc("POST /api/runs/{id}/cancel", s.operator(s.handleCancelRun))
+	s.mux.HandleFunc("GET /api/deployments", s.operator(s.handleDeployments))
+	s.mux.HandleFunc("POST /api/deployments/rollback", s.operator(s.handleRollback))
 	s.mux.HandleFunc("GET /api/runs/{id}", s.operator(s.handleGetRun))
 	s.mux.HandleFunc("POST /api/runs/{id}/rerun", s.operator(s.handleRerun))
 	s.mux.HandleFunc("GET /api/jobs/{id}/logs", s.operator(s.handleJobLogs))
@@ -508,6 +510,9 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.log.Info("task finished", "job", jobID, "result", req.State.Result)
+		// Before announcing: a deployment's ledger row should exist by the time
+		// anyone follows the notification to look at it.
+		s.recordDeployment(ctx, jobID, string(req.State.Result))
 		s.announce(ctx, outcome)
 		s.wake.broadcast()
 	}
@@ -616,6 +621,12 @@ func newJobsFor(wf *workflow.Workflow, source []byte) ([]store.NewJob, error) {
 			nj.RetryMax = j.Retry.MaxAttempts
 			nj.RetryBackoff = j.Retry.BackoffSeconds
 			nj.RetryOn = j.Retry.On
+		}
+		if j.Environment != nil {
+			nj.Environment = j.Environment.Name
+			nj.EnvironmentURL = j.Environment.URL
+			nj.AutoRollback = j.Environment.AutoRollback
+			nj.VersionFrom = j.Environment.VersionFrom
 		}
 		jobs = append(jobs, nj)
 	}

@@ -46,9 +46,12 @@ type Job struct {
 	Env            map[string]string `yaml:"env"`
 	If             string            `yaml:"if"`
 	// Retry is Orrery's own key; GitHub has no job retry at all.
-	Retry   *Retry            `yaml:"retry"`
-	Steps   []Step            `yaml:"steps"`
-	Outputs map[string]string `yaml:"outputs"`
+	Retry *Retry `yaml:"retry"`
+	// Environment marks this job as a deployment. GitHub records the same
+	// thing; what it does not give you is anything to do with the record.
+	Environment *Environment      `yaml:"environment"`
+	Steps       []Step            `yaml:"steps"`
+	Outputs     map[string]string `yaml:"outputs"`
 }
 
 // Step is one step of a job.

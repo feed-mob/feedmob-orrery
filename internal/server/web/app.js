@@ -106,6 +106,7 @@ function renderSignIn(message) {
 function renderNav(active) {
   const items = [
     ['#/', 'RUNS'],
+    ['#/deployments', '部署'],
     ['#/runners', 'RUNNERS'],
     ['#/schedules', '定时'],
   ];
@@ -499,6 +500,45 @@ async function renderSchedules() {
   return scheds;
 }
 
+// ----------------------------------------------------------- deployments --
+
+// The deployments page answers the question anyone asks first when something is
+// wrong: which version is on production right now. A run listing cannot answer
+// it — it only knows that job 47 passed.
+async function renderDeployments() {
+  renderNav('#/deployments');
+  crumb.textContent = '';
+  const current = await api('/api/deployments');
+  if (!current.length) {
+    app.replaceChildren(card('部署', el('div', { class: 'empty' },
+      '还没有部署记录。给部署 job 加上 `environment: production`，它跑完就会记一笔。')));
+    return current;
+  }
+  const rows = current.map(d => el('tr', {},
+    el('td', {}, el('strong', {}, d.Environment),
+      d.URL ? el('a', { href: d.URL, target: '_blank', class: 'dim', style: 'margin-left:8px' }, '↗') : null),
+    el('td', { class: 'mono dim secondary' }, d.Repo),
+    el('td', { class: 'mono' }, d.Version),
+    el('td', { class: 'mono dim secondary' }, (d.SHA || '').slice(0, 7)),
+    el('td', {}, el('span', { class: 'badge ' + toneOf('done', d.Result) }, d.Result),
+      d.RolledBackFrom ? el('span', { class: 'dim' }, ' 回滚') : null),
+    el('td', { class: 'dim' }, el('a', { href: '#/runs/' + d.RunID }, '#' + d.RunID)),
+    el('td', { class: 'dim' }, ago(d.CreatedAt)),
+    el('td', {}, el('button', {
+      onclick: () => act('/api/deployments/rollback', '回滚',
+        { repo: d.Repo, environment: d.Environment }),
+    }, '回滚'))));
+
+  app.replaceChildren(el('div', { class: 'card' },
+    el('h2', {}, '当前部署', el('span', { class: 'spacer' }),
+      el('span', { class: 'dim' }, current.length + ' 个环境')),
+    table(['环境', ['仓库', 'secondary'], '版本', ['COMMIT', 'secondary'],
+           '结果', 'RUN', '时间', ''], rows),
+    el('div', { class: 'dim pad' },
+      '「回滚」会用上一个成功版本重新派发当初那个部署 workflow——它是一次新的部署，不是撤销。')));
+  return current;
+}
+
 // -------------------------------------------------------------- dispatch --
 
 async function renderDispatch() {
@@ -646,6 +686,7 @@ async function route() {
     let live;
     const run = hash.match(/^#\/runs\/(\d+)/);
     if (run) live = await renderRun(Number(run[1]));
+    else if (hash === '#/deployments') live = await renderDeployments();
     else if (hash === '#/runners') live = await renderRunners();
     else if (hash === '#/schedules') live = await renderSchedules();
     else if (hash === '#/dispatch') live = await renderDispatch();

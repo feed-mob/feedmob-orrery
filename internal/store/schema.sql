@@ -112,6 +112,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     retry_on      TEXT    NOT NULL DEFAULT '[]',
     retry_after   TEXT,
 
+    -- `environment:` on the job. Set means this job is a deployment, and its
+    -- outcome belongs in the deployments ledger as well as the run's.
+    environment      TEXT    NOT NULL DEFAULT '',
+    environment_url  TEXT    NOT NULL DEFAULT '',
+    auto_rollback    INTEGER NOT NULL DEFAULT 0,
+    version_from     TEXT    NOT NULL DEFAULT '',
+
     UNIQUE (run_id, job_key)
 );
 
@@ -200,3 +207,35 @@ CREATE TABLE IF NOT EXISTS notify_state (
     result      TEXT NOT NULL,
     notified_at TEXT NOT NULL
 );
+
+-- Deployments: what went where, when, and whether it worked.
+--
+-- A run's ledger answers "did job 47 pass". It cannot answer "which version is
+-- on production right now", which is the question anyone asks first when
+-- something is wrong. GitHub records deployments too and then gives you almost
+-- nothing to do with the record; this table is what rollback reads.
+--
+-- Append-only. A rollback is a new row, not an edit of the one it replaces:
+-- "we went back" is itself a thing that happened.
+CREATE TABLE IF NOT EXISTS deployments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo        TEXT    NOT NULL,
+    environment TEXT    NOT NULL,
+    -- What was deployed, as an operator would name it: usually an image tag.
+    -- Falls back to the commit when the job reports nothing better.
+    version     TEXT    NOT NULL,
+    sha         TEXT    NOT NULL DEFAULT '',
+    ref         TEXT    NOT NULL DEFAULT '',
+    url         TEXT    NOT NULL DEFAULT '',
+    run_id      INTEGER NOT NULL REFERENCES runs (id) ON DELETE CASCADE,
+    job_id      INTEGER NOT NULL,
+    workflow_file TEXT  NOT NULL DEFAULT '',
+    actor       TEXT    NOT NULL DEFAULT '',
+    result      TEXT    NOT NULL,              -- success|failure|cancelled
+    -- Set when this deployment exists because an earlier one was rolled back.
+    rolled_back_from INTEGER,
+    created_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployments_current
+    ON deployments (repo, environment, id DESC);

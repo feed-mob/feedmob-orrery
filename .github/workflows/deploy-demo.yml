@@ -1,0 +1,43 @@
+# 部署原语示例：environment 让这个 job 进入部署台账，回滚读的就是那张台账。
+#
+# 只能手动触发，不会因为提交自动运行。它不做任何真实部署，只回显。
+name: Deploy Demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 部署到哪个环境
+        type: choice
+        options: [staging, production]
+        required: true
+      version:
+        description: 版本或镜像 tag；回滚时 Orrery 会把上一个好版本填进这里
+        type: string
+        default: latest
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: [self-hosted]
+    timeout-minutes: 5
+    # 这一行让它成为一次「部署」而不只是一个 job
+    environment:
+      name: ${{ inputs.environment }}
+      url: https://example.invalid
+      version-from: deployed
+    outputs:
+      deployed: ${{ steps.v.outputs.value }}
+    # 部署最常见的失败是网络抖一下，不是代码错
+    retry:
+      max-attempts: 2
+      backoff-seconds: 5
+    steps:
+      - name: Resolve the version
+        id: v
+        run: |
+          V="${{ inputs.version }}"
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+          echo "deploying $V to ${{ inputs.environment }}"
+      - name: Pretend to deploy
+        run: echo "DEPLOYED ${{ steps.v.outputs.value }}"
