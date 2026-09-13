@@ -90,11 +90,16 @@ func (s *Store) DeploymentHistory(ctx context.Context, repo, env string, limit i
 }
 
 // LastGoodDeployment is what a rollback goes back to: the most recent success
-// that is not the one being rolled back.
+// of a *different* version than the one live now.
+//
+// Different version, not simply the previous row. Deploying v2 twice and then
+// rolling back should land on v1 — the row before is still v2, and "rolling
+// back" to the version you are already running is the button doing nothing
+// while looking like it worked.
 //
 // `before` excludes everything from that id onwards, so rolling back twice
 // walks further back rather than bouncing between the same two versions.
-func (s *Store) LastGoodDeployment(ctx context.Context, repo, env string, before int64) (*Deployment, error) {
+func (s *Store) LastGoodDeployment(ctx context.Context, repo, env string, before int64, notVersion string) (*Deployment, error) {
 	q := `SELECT id, repo, environment, version, sha, ref, url, run_id, job_id, workflow_file,
 	             actor, result, rolled_back_from, created_at
 	      FROM deployments WHERE repo = ? AND environment = ? AND result = 'success'`
@@ -102,6 +107,10 @@ func (s *Store) LastGoodDeployment(ctx context.Context, repo, env string, before
 	if before > 0 {
 		q += " AND id < ?"
 		args = append(args, before)
+	}
+	if notVersion != "" {
+		q += " AND version != ?"
+		args = append(args, notVersion)
 	}
 	q += " ORDER BY id DESC LIMIT 1"
 
@@ -189,4 +198,24 @@ func (s *Store) DeployInfo(ctx context.Context, jobID int64) (*DeployJob, error)
 	}
 	d.AutoRollback = auto == 1
 	return &d, nil
+}
+
+// DeploymentByID reads one row.
+func (s *Store) DeploymentByID(ctx context.Context, id int64) (*Deployment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, repo, environment, version, sha, ref, url, run_id, job_id, workflow_file,
+		       actor, result, rolled_back_from, created_at
+		FROM deployments WHERE id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out, err := scanDeployments(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, ErrNotFound
+	}
+	return &out[0], nil
 }

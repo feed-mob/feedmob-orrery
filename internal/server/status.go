@@ -147,6 +147,64 @@ func (s *Server) announce(ctx context.Context, outcome *store.RunOutcome) {
 	}()
 }
 
+// prepare resolves everything in a run that is written as an expression, then
+// creates it.
+//
+// One seam for all five ways a run starts — CLI submit, webhook, dispatch,
+// schedule, chain. They had the same three steps copied five times, which is
+// how `environment:` came to be interpolated in none of them.
+func (s *Server) prepare(ctx context.Context, wf *workflow.Workflow, run *store.Run,
+	jobs []store.NewJob, inputs map[string]string) (int64, error) {
+	env := gate.Env{
+		Github: gate.GithubFor(run.Repo, run.Ref, run.SHA, run.Actor, run.Event,
+			run.WorkflowName, "0", "0", run.EventPayload),
+		Vars:   s.cfg.Vars,
+		Inputs: anyMap(inputs),
+	}
+	if err := s.applyConcurrency(wf, run, env); err != nil {
+		return 0, err
+	}
+	// `environment: ${{ inputs.environment }}` is the normal way to write one
+	// deploy workflow that serves staging and production. Storing the
+	// expression verbatim would file every deployment under the same name, and
+	// "which version is on production" would have no answer at all.
+	for i := range jobs {
+		if jobs[i].Environment == "" {
+			continue
+		}
+		name, err := gate.Interpolate(jobs[i].Environment, env)
+		if err != nil {
+			return 0, fmt.Errorf("job %q environment: %w", jobs[i].Key, err)
+		}
+		if name == "" {
+			return 0, fmt.Errorf("job %q: environment resolved to nothing (%q)",
+				jobs[i].Key, jobs[i].Environment)
+		}
+		jobs[i].Environment = name
+		if url, err := gate.Interpolate(jobs[i].EnvironmentURL, env); err == nil {
+			jobs[i].EnvironmentURL = url
+		}
+	}
+	id, err := s.st.CreateRun(ctx, *run, jobs)
+	if err != nil {
+		return 0, err
+	}
+	run.ID = id
+	s.wake.broadcast()
+	return id, nil
+}
+
+func anyMap(m map[string]string) map[string]any {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 // applyConcurrency resolves the run's concurrency group.
 //
 // The group is an expression — almost always `${{ github.workflow }}-${{
@@ -154,7 +212,7 @@ func (s *Server) announce(ctx context.Context, outcome *store.RunOutcome) {
 // A workflow that declares none gets the platform default, which is the
 // difference between "GitHub has this feature and you forgot to use it" and
 // "two pushes cannot deploy at the same time".
-func (s *Server) applyConcurrency(wf *workflow.Workflow, run *store.Run) error {
+func (s *Server) applyConcurrency(wf *workflow.Workflow, run *store.Run, env gate.Env) error {
 	c, err := wf.Concurrency()
 	if err != nil {
 		return err
@@ -166,11 +224,7 @@ func (s *Server) applyConcurrency(wf *workflow.Workflow, run *store.Run) error {
 	if expr == "" {
 		return nil
 	}
-	group, err := gate.Interpolate(expr, gate.Env{
-		Github: gate.GithubFor(run.Repo, run.Ref, run.SHA, run.Actor, run.Event,
-			run.WorkflowName, "0", "0", run.EventPayload),
-		Vars: s.cfg.Vars,
-	})
+	group, err := gate.Interpolate(expr, env)
 	if err != nil {
 		return fmt.Errorf("concurrency group: %w", err)
 	}

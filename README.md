@@ -166,6 +166,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **仓库白名单** | ✅ `-repos`；签名不等于"这个仓库归我们管" |
 | **API / UI 认证** | ✅ 无 token 拒绝启动；bearer / HttpOnly 会话 cookie；webhook 走签名、healthz 开放 |
 | **Web UI**（#32） | ✅ 编译进二进制，无 CDN；run 列表、步骤时间线、日志、重跑、停止；深色与手机适配 |
+| **部署台账与回滚**（#58 #59 #60） | ✅ `environment:` 记账；一键回滚（跳过当前版本、连按会一直往回走）；`auto-rollback` |
 | **`workflow_run` 链式触发**（#37） | ✅ 一个 workflow 落定后触发另一个；只跳一跳，不会成环 |
 | **自动重试**（#66） | ✅ job 级 `retry:`，指数退避；GitHub 完全没有这个 |
 | **重跑**（#53） | ✅ `rerun [--failed]`：run 保持不变、attempt +1；成功 job 的产物与 outputs 留着给被重跑的用 |
@@ -318,6 +319,41 @@ GitHub App，再升级到 Checks API 拿 diff 行内注解。
 那几行，不是每两秒把整份日志重新拉一遍。渲染上限 5000 行，超出给「纯文本」链接。
 
 只在有东西真的在动的时候才轮询——没人看的时候还在敲自己控制面的面板，本身就是一次故障。
+
+### 部署台账与回滚
+
+一份 run 的台账能回答"job 47 过了没"。它回答不了**"现在 production 上跑的是哪个版本"**
+——而那是出事时任何人先问的问题。给部署 job 加一行：
+
+```yaml
+jobs:
+  deploy:
+    environment:
+      name: ${{ inputs.environment }}   # 表达式会被求值，不是当字面量存
+      url: https://app.example.com
+      version-from: image_tag           # 读哪个 job output 当版本；不写就用 commit
+      auto-rollback: true               # 失败时自动退回上一个好版本（默认关）
+    outputs:
+      image_tag: ${{ steps.build.outputs.tag }}
+```
+
+跑完就记一笔。面板「部署」页显示每个环境的当前版本、commit、结果、是谁什么时候部的，
+一个按钮回滚。
+
+**回滚是一次新的部署，不是撤销。** 它把当初那个部署 workflow 用上一个好版本重新派发
+一遍——别的做法等于假装我们能伸手进服务器把文件放回去，我们不能，只有那个 deploy
+workflow 知道怎么做。所以它要求 workflow 声明一个版本参数（`version` / `image` /
+`image_tag` / `tag` 之一），没有的话它会直说，而不是用最新代码冒充旧版本。
+
+两个容易做错、我们做对了的地方：
+
+- **回滚跳过当前版本本身。** 同一个版本部了两次再回滚，该落到上上个版本——上一行还是
+  同一个版本，"回滚"到你正跑着的版本就是按钮什么也没做却看起来成功了。
+- **连着回滚会一直往回走。** 第二次按不会弹回你刚逃离的那个版本。实测 v3 → v2 → v1 →
+  「没得回了」。
+
+**失败的部署也记。** 它是那一页上最值得看的一行——不记的话，环境会安安静静地继续显示
+上一个版本，就像什么都没发生过。
 
 ### `workflow_run`：build 和 deploy 分开
 

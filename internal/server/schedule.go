@@ -135,19 +135,11 @@ func (s *Server) startScheduled(ctx context.Context, sc store.Schedule) (int64, 
 		Event: "schedule", Ref: "refs/heads/" + sc.Ref, SHA: sha, Actor: "orrery",
 		EventPayload: string(payload),
 	}
-	if err := s.applyConcurrency(wf, &run); err != nil {
-		return 0, err
-	}
 	// Overlap is handled by the concurrency group rather than by a policy of
 	// its own: a scheduled run that is still going when the next is due makes
 	// the next one wait, which is the "skip/queue" behaviour GitHub's schedules
 	// do not offer at all.
-	id, err := s.st.CreateRun(ctx, run, jobs)
-	if err != nil {
-		return 0, err
-	}
-	s.wake.broadcast()
-	return id, nil
+	return s.prepare(ctx, wf, &run, jobs, nil)
 }
 
 // RunPruner enforces the retention window.
@@ -245,16 +237,11 @@ func (s *Server) chainWorkflowRun(ctx context.Context, upstream *store.Run) {
 			Event: "workflow_run", Ref: upstream.Ref, SHA: upstream.SHA,
 			Actor: upstream.Actor, EventPayload: string(payload),
 		}
-		if err := s.applyConcurrency(wf, &run); err != nil {
-			s.log.Error("cannot apply concurrency to the chained run", "file", f.Path, "err", err)
-			continue
-		}
-		id, err := s.st.CreateRun(ctx, run, jobs)
+		id, err := s.prepare(ctx, wf, &run, jobs, nil)
 		if err != nil {
 			s.log.Error("cannot create the chained run", "file", f.Path, "err", err)
 			continue
 		}
-		s.wake.broadcast()
 		s.reportStatus(&run, forge.StatePending, fmt.Sprintf("%d job(s) queued", len(jobs)))
 		s.log.Info("chained a run", "from", upstream.ID, "to", id,
 			"workflow", wf.Name, "conclusion", upstream.Result)

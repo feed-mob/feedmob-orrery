@@ -266,14 +266,10 @@ func (s *Server) queueRun(ctx context.Context, wf *workflow.Workflow, f forge.Fi
 		Actor:        p.Sender.Login,
 		EventPayload: string(payload),
 	}
-	if err := s.applyConcurrency(wf, &run); err != nil {
-		return 0, err
-	}
-	id, err := s.st.CreateRun(ctx, run, jobs)
+	id, err := s.prepare(ctx, wf, &run, jobs, nil)
 	if err != nil {
 		return 0, err
 	}
-	s.wake.broadcast()
 	// Report pending immediately. A required check that only appears once the
 	// run finishes gives a reviewer a green pull request in the window where
 	// nothing has been checked yet.
@@ -379,19 +375,27 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 // Shared with rollback, which is a dispatch of the workflow that deployed the
 // last good version — same path, so a rolled-back deployment is recorded and
 // reported exactly like any other.
+// rollbackOf, when non-zero, is the deployment row this dispatch is putting
+// back. It rides in the event payload so the next rollback can tell where this
+// version really sits in the history.
 func (s *Server) startDispatch(ctx context.Context, repo string, file *forge.File,
-	wf *workflow.Workflow, sha, ref, actor string, inputs map[string]string) (int64, error) {
+	wf *workflow.Workflow, sha, ref, actor string, inputs map[string]string,
+	rollbackOf ...int64) (int64, error) {
 	jobs, err := newJobsFor(wf, file.Content)
 	if err != nil {
 		return 0, err
 	}
 	// GitHub puts the values under github.event.inputs, as strings, and both
 	// `github.event.inputs.*` and the newer `inputs.*` are read from there.
-	payload, err := json.Marshal(map[string]any{
+	event := map[string]any{
 		"inputs":   inputs,
 		"ref":      ref,
 		"workflow": file.Path,
-	})
+	}
+	if len(rollbackOf) > 0 && rollbackOf[0] > 0 {
+		event["rollback_of"] = rollbackOf[0]
+	}
+	payload, err := json.Marshal(event)
 	if err != nil {
 		return 0, err
 	}
@@ -400,15 +404,10 @@ func (s *Server) startDispatch(ctx context.Context, repo string, file *forge.Fil
 		Event: "workflow_dispatch", Ref: refName(ref), SHA: sha,
 		Actor: actor, EventPayload: string(payload),
 	}
-	if err := s.applyConcurrency(wf, &run); err != nil {
-		return 0, err
-	}
-	runID, err := s.st.CreateRun(ctx, run, jobs)
+	runID, err := s.prepare(ctx, wf, &run, jobs, inputs)
 	if err != nil {
 		return 0, err
 	}
-	s.wake.broadcast()
-	run.ID = runID
 	s.reportStatus(&run, forge.StatePending, fmt.Sprintf("%d job(s) queued", len(jobs)))
 	s.log.Info("workflow dispatched", "run", runID, "repo", repo,
 		"workflow", file.Path, "ref", ref, "actor", actor, "inputs", inputNames(inputs))

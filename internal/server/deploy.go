@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -34,8 +35,19 @@ func (s *Server) recordDeployment(ctx context.Context, jobID int64, result strin
 		s.log.Error("cannot read the run for the deployment ledger", "job", jobID, "err", err)
 		return
 	}
+	// A run created by a rollback says so in its event payload; carrying it
+	// into the ledger is what lets the next rollback walk further back instead
+	// of bouncing between two versions.
+	var rolledBackFrom *int64
+	var payload struct {
+		RollbackOf int64 `json:"rollback_of"`
+	}
+	if json.Unmarshal([]byte(run.EventPayload), &payload) == nil && payload.RollbackOf > 0 {
+		rolledBackFrom = &payload.RollbackOf
+	}
 	d := store.Deployment{
-		Repo: run.Repo, Environment: info.Environment,
+		RolledBackFrom: rolledBackFrom,
+		Repo:           run.Repo, Environment: info.Environment,
 		Version: env.Version(outputs, info.SHA), SHA: info.SHA, Ref: info.Ref,
 		URL: info.URL, RunID: info.RunID, JobID: jobID,
 		WorkflowFile: info.WorkflowFile, Actor: info.Actor, Result: result,
@@ -74,9 +86,42 @@ func (s *Server) recordDeployment(ctx context.Context, jobID int64, result strin
 // is nothing to tell it which version to put back, and the honest answer is to
 // say so rather than redeploy the newest code under the name "rollback".
 func (s *Server) rollback(ctx context.Context, repo, env string, from int64, by string) (int64, error) {
-	good, err := s.st.LastGoodDeployment(ctx, repo, env, from)
+	// "Roll back" means "go back from where we are", so the deployment that is
+	// live right now has to be excluded. Without this the newest success is
+	// both the thing being rolled back and the thing rolled back to, and the
+	// button redeploys exactly what is already there.
+	liveVersion := ""
+	if from == 0 {
+		current, err := s.st.CurrentDeployments(ctx, repo)
+		if err != nil {
+			return 0, err
+		}
+		for _, d := range current {
+			if d.Environment != env {
+				continue
+			}
+			liveVersion = d.Version
+			// Walk back from where this version *originally* sat in the
+			// history, not from the row a previous rollback appended. Rolling
+			// back twice should keep going back; without this the second press
+			// finds the version you just escaped and redeploys it, which is the
+			// opposite of what someone pressing it twice wants.
+			from = d.ID
+			if d.RolledBackFrom != nil {
+				from = *d.RolledBackFrom
+			}
+			break
+		}
+		if from == 0 {
+			return 0, fmt.Errorf("%s/%s has never been deployed", repo, env)
+		}
+	} else if d, err := s.st.DeploymentByID(ctx, from); err == nil {
+		liveVersion = d.Version
+	}
+	good, err := s.st.LastGoodDeployment(ctx, repo, env, from, liveVersion)
 	if errors.Is(err, store.ErrNotFound) {
-		return 0, fmt.Errorf("%s/%s has no earlier successful deployment to go back to", repo, env)
+		return 0, fmt.Errorf("%s/%s has no earlier successful deployment of a different version "+
+			"to go back to (current: %s)", repo, env, liveVersion)
 	}
 	if err != nil {
 		return 0, err
@@ -129,7 +174,11 @@ func (s *Server) rollback(ctx context.Context, repo, env string, from int64, by 
 	if err != nil {
 		return 0, err
 	}
-	runID, err := s.startDispatch(ctx, repo, file, wf, good.SHA, good.Ref, by, values)
+	// The resulting deployment records which row it is a repeat of, so the next
+	// rollback knows where in the history this version really sits. Carried in
+	// the event payload rather than in memory: it has to survive a restart, and
+	// the payload's job is to say why a run exists.
+	runID, err := s.startDispatch(ctx, repo, file, wf, good.SHA, good.Ref, by, values, good.ID)
 	if err != nil {
 		return 0, err
 	}
@@ -177,7 +226,8 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, fmt.Sprintf("repository %q is not in -repos", req.Repo))
 		return
 	}
-	// from 0: go back from wherever the environment is now.
+	// 0: rollback works out where the environment is now and goes back from
+	// there.
 	runID, err := s.rollback(r.Context(), req.Repo, req.Environment, 0, "ui")
 	if err != nil {
 		writeErr(w, http.StatusConflict, err.Error())

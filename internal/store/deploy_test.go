@@ -54,7 +54,7 @@ func TestDeploymentLedger(t *testing.T) {
 	}
 
 	// Rollback goes back to the last success before the one being replaced.
-	good, err := st.LastGoodDeployment(ctx, "feed-mob/app", "production", badID)
+	good, err := st.LastGoodDeployment(ctx, "feed-mob/app", "production", badID, "v4")
 	if err != nil {
 		t.Fatalf("last good: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestDeploymentLedger(t *testing.T) {
 		t.Errorf("last good = %q, want v2", good.Version)
 	}
 	// Rolling back again walks further back rather than bouncing between two.
-	again, err := st.LastGoodDeployment(ctx, "feed-mob/app", "production", good.ID)
+	again, err := st.LastGoodDeployment(ctx, "feed-mob/app", "production", good.ID, good.Version)
 	if err != nil {
 		t.Fatalf("last good again: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestDeploymentLedger(t *testing.T) {
 	}
 
 	// Nothing to go back to must say so rather than invent a version.
-	if _, err := st.LastGoodDeployment(ctx, "feed-mob/app", "never-deployed", 0); !errors.Is(err, ErrNotFound) {
+	if _, err := st.LastGoodDeployment(ctx, "feed-mob/app", "never-deployed", 0, ""); !errors.Is(err, ErrNotFound) {
 		t.Errorf("an environment with no history: %v", err)
 	}
 
@@ -125,5 +125,54 @@ func TestDeployInfoJoinsTheRun(t *testing.T) {
 	}
 	if plain.Environment != "" {
 		t.Errorf("an ordinary job reported an environment: %+v", plain)
+	}
+}
+
+// Deploying v2 twice and then rolling back should land on v1. The row before is
+// still v2, and "rolling back" to the version you are already running is the
+// button doing nothing while looking like it worked.
+func TestRollbackSkipsTheVersionAlreadyLive(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	runID, err := st.CreateRun(ctx, Run{Repo: "r", WorkflowName: "w"},
+		[]NewJob{{Key: "d", Payload: "p", Environment: "production"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sum, _ := st.RunByID(ctx, runID)
+	for _, v := range []string{"v1", "v2", "v2"} {
+		if _, err := st.RecordDeployment(ctx, Deployment{
+			Repo: "r", Environment: "production", Version: v,
+			RunID: runID, JobID: sum.Jobs[0].ID, Result: "success",
+		}); err != nil {
+			t.Fatalf("record %s: %v", v, err)
+		}
+	}
+	current, _ := st.CurrentDeployments(ctx, "r")
+	live := current[0]
+	if live.Version != "v2" {
+		t.Fatalf("live = %q", live.Version)
+	}
+	good, err := st.LastGoodDeployment(ctx, "r", "production", live.ID, live.Version)
+	if err != nil {
+		t.Fatalf("last good: %v", err)
+	}
+	if good.Version != "v1" {
+		t.Errorf("rollback target = %q, want v1 — the row before is still v2", good.Version)
+	}
+
+	// Only ever one version deployed: there is nothing to go back to, and
+	// saying so beats redeploying what is already there.
+	st2 := testStore(t)
+	r2, _ := st2.CreateRun(ctx, Run{Repo: "r", WorkflowName: "w"},
+		[]NewJob{{Key: "d", Payload: "p"}})
+	s2, _ := st2.RunByID(ctx, r2)
+	_, _ = st2.RecordDeployment(ctx, Deployment{
+		Repo: "r", Environment: "production", Version: "v1",
+		RunID: r2, JobID: s2.Jobs[0].ID, Result: "success",
+	})
+	cur, _ := st2.CurrentDeployments(ctx, "r")
+	if _, err := st2.LastGoodDeployment(ctx, "r", "production", cur[0].ID, "v1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a single-version history offered a rollback target: %v", err)
 	}
 }

@@ -586,16 +586,11 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 		Repo: req.Repo, WorkflowName: wf.Name, WorkflowFile: req.WorkflowFile,
 		Event: orDefault(req.Event, "manual"), Ref: req.Ref, SHA: req.SHA, Actor: req.Actor,
 	}
-	if err := s.applyConcurrency(wf, &run); err != nil {
+	runID, err := s.prepare(r.Context(), wf, &run, jobs, nil)
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	runID, err := s.st.CreateRun(r.Context(), run, jobs)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	s.wake.broadcast()
 	// Recording which third-party actions a run pulls in is the input to
 	// pinning them by SHA behind a mirror later; it costs nothing now.
 	s.log.Info("run created", "run", runID, "workflow", wf.Name,
