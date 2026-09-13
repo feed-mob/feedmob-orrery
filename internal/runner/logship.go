@@ -53,6 +53,18 @@ func (s *logShipper) nextIndex() int64 {
 	return s.base + int64(len(s.buf))
 }
 
+// buffered returns the lines waiting to be shipped. Test-only: it is how a
+// unit test sees what the shipper would send without standing up a server.
+func (s *logShipper) buffered() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.buf))
+	for _, r := range s.buf {
+		out = append(out, r.Content)
+	}
+	return out
+}
+
 // flush ships everything past the last ack.
 func (s *logShipper) flush(ctx context.Context) {
 	s.mu.Lock()

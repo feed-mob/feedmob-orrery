@@ -149,7 +149,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **容器执行** | ✅ `ubuntu-latest:docker://…` 起容器；`self-hosted:host` 跑宿主机；同一 runner 兼顾 |
 | 表达式、`::group::`、`::error::`、矩阵、`services`、composite action | ✅ 由 act 承担（见 L2） |
 | 步骤时间线（名称 / 结果 / 耗时 / 日志区间） | ✅ 落库并在 CLI 展示 |
-| 密钥注入与作用域 | ✅ 派发时注入，不落库；日志只打印密钥名 |
+| 密钥注入、作用域与日志打码 | ✅ 派发时注入、不落库；日志里 `secrets.*` 全部打成 `***`，`::add-mask::` 的值也打掉，见下 |
 | **git 事件触发**（#1 #36 #38） | ✅ 签名校验的 GitHub webhook；按 delivery id 幂等；`branches` / `tags` / `paths` / `types` 过滤 |
 | **定时触发**（#2） | ✅ `on: schedule`，从默认分支注册；重叠由并发组接管——GitHub 根本没有重叠策略 |
 | **带参手动触发**（#3） | ✅ `workflow_dispatch` inputs：required / default / choice / boolean / number 全部在 run 创建前校验 |
@@ -164,6 +164,23 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **重跑**（#53） | ✅ `rerun [--failed]`：run 保持不变、attempt +1；成功 job 的产物与 outputs 留着给被重跑的用 |
 | `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
 | RBAC：谁能触发 / 审批 / 看日志（#73） | ⛔ 共享令牌没有"谁"，需要先定身份方案 |
+
+### 密钥与日志打码
+
+密钥只在派发时注入进程和容器，**不落库**——泄露一份数据库文件不等于泄露一套凭据。
+
+日志侧要说清楚一件事：**act 在它的 formatter 里打码，而 logrus 的 hook 跑在
+formatting 之前**。我们是用 hook 取日志的，所以拿到的是未打码的原文——不自己打一遍，
+一个 `echo $SECRET` 就会把明文写进数据库和面板。现在在 hook 里打：
+
+- `secrets.*` 里的值：全文替换成 `***`
+- `::add-mask::<值>` ：宣布密钥的那一行本身带着值，而它到达 hook 时 act 还没来得及
+  把值加进 mask 列表——所以这一行单独重写成 `::add-mask::***`
+- 之后出现的该值：同样打成 `***`
+
+**一个例外，和 GitHub 一样**：`run:` 的脚本会在 group 头里原样回显一次。写死在
+workflow 文件里的字面量就在那个文件里，回显自然带着它。密钥要从 `secrets.*` 来，
+不要写进 YAML。
 
 ### 认证
 

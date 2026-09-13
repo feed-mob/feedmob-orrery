@@ -73,7 +73,7 @@ func TestGithubContextCarriesForgeURLs(t *testing.T) {
 // step from whichever pass logged first puts a later step's start before an
 // earlier one's, because Pre passes run during job setup.
 func TestHookTimesStepsFromTheMainStageOnly(t *testing.T) {
-	h := newActHook(newTestShipper(), 2)
+	h := newActHook(newTestShipper(), 2, nil)
 	base := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
 
 	fire := func(n int, name, stage string, at time.Time, result any) {
@@ -120,7 +120,7 @@ func TestHookTimesStepsFromTheMainStageOnly(t *testing.T) {
 // A step whose Pre stage fails never reaches Main, and must still report when
 // it started rather than settling with a stop time and no beginning.
 func TestHookStartsAStepThatOnlyFailedInPre(t *testing.T) {
-	h := newActHook(newTestShipper(), 1)
+	h := newActHook(newTestShipper(), 1, nil)
 	at := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
 	_ = h.Fire(&logrus.Entry{
 		Data:  logrus.Fields{"stepNumber": 0, "step": "Broken", "stage": "Pre", "stepResult": "failure"},
@@ -213,5 +213,61 @@ jobs:
 	// that act refuses to plan a job whose upstreams are missing.
 	if _, err := model.CombineWorkflowPlanner(wf).PlanJob("deploy"); err != nil {
 		t.Fatalf("plan with stubs: %v", err)
+	}
+}
+
+// act masks secrets in its *formatter*, and a logrus hook runs before
+// formatting. Everything this hook ships is therefore the raw message: without
+// masking here, a step that echoes a secret writes it into the database and
+// onto the dashboard in the clear.
+func TestHookMasksSecrets(t *testing.T) {
+	shipper := newTestShipper()
+	h := newActHook(shipper, 1, map[string]string{
+		"GITHUB_TOKEN": "ghp_supersecretvalue",
+		"EMPTYISH":     "x", // one character: too short to mask safely
+	})
+	fire := func(msg string) {
+		_ = h.Fire(&logrus.Entry{
+			Data:    logrus.Fields{"raw_output": true},
+			Time:    time.Now(),
+			Level:   logrus.InfoLevel,
+			Message: msg,
+		})
+	}
+	fire("cloning with ghp_supersecretvalue now")
+	fire("::add-mask::another-secret-value")
+	fire("plain line")
+
+	got := shipper.buffered()
+	if len(got) != 3 {
+		t.Fatalf("shipped %d lines: %+v", len(got), got)
+	}
+	if strings.Contains(got[0], "ghp_supersecretvalue") {
+		t.Errorf("a secret reached the log: %q", got[0])
+	}
+	if !strings.Contains(got[0], "***") {
+		t.Errorf("the secret was removed but not marked: %q", got[0])
+	}
+	// The line that announces a secret must not be the line that prints it: it
+	// reaches this hook before act has added the value to its mask list.
+	if strings.Contains(got[1], "another-secret-value") {
+		t.Errorf("::add-mask:: leaked its own value: %q", got[1])
+	}
+	if got[2] != "plain line" {
+		t.Errorf("an ordinary line was altered: %q", got[2])
+	}
+}
+
+func TestRedactAddMask(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"::add-mask::hunter2", "::add-mask::***"},
+		{"::add-mask:: hunter2", "::add-mask::***"},
+		{"prefix ::add-mask::hunter2", "prefix ::add-mask::***"},
+		{"::add-mask::", "::add-mask::"}, // nothing to hide
+		{"nothing here", "nothing here"},
+	} {
+		if got := redactAddMask(tc.in); got != tc.want {
+			t.Errorf("redactAddMask(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

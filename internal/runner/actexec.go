@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,7 +91,7 @@ func (e *actExecutor) run(ctx context.Context, task *protocol.Task, workdir stri
 		return nil, err
 	}
 
-	hook := newActHook(logs, len(job.Steps))
+	hook := newActHook(logs, len(job.Steps), task.Secrets)
 
 	repo, _ := task.Context["repository"].(string)
 	svcEnv, endJob := e.artifacts.beginJob(repo)
@@ -376,18 +377,66 @@ func orElse(v, def string) string {
 type actHook struct {
 	logs *logShipper
 
+	// baseMask is the replacer pairs for this task's secrets. act masks in its
+	// *formatter*, and a logrus hook runs before formatting, so everything this
+	// hook ships is the raw message: without masking here, a step that echoes a
+	// secret puts it in the database and on the dashboard in the clear.
+	baseMask []string
+	replacer *strings.Replacer
+
 	mu      sync.Mutex
 	steps   []protocol.StepState
 	jobRes  protocol.Result
 	started map[int]bool
 }
 
-func newActHook(logs *logShipper, stepCount int) *actHook {
-	return &actHook{
-		logs:    logs,
-		steps:   make([]protocol.StepState, 0, stepCount),
-		started: map[int]bool{},
+func newActHook(logs *logShipper, stepCount int, secrets map[string]string) *actHook {
+	var pairs []string
+	for _, v := range secrets {
+		pairs = actrunner.AppendSecretMasker(pairs, v)
 	}
+	return &actHook{
+		logs:     logs,
+		baseMask: pairs,
+		replacer: strings.NewReplacer(pairs...),
+		steps:    make([]protocol.StepState, 0, stepCount),
+		started:  map[int]bool{},
+	}
+}
+
+// mask applies this task's secrets plus whatever the job has added at runtime
+// with `::add-mask::`, which is how an action tells the engine that a value it
+// just computed is sensitive.
+func (h *actHook) mask(entry *logrus.Entry, s string) string {
+	var dynamic []string
+	if entry.Context != nil {
+		if m := actrunner.Masks(entry.Context); m != nil {
+			dynamic = *m
+		}
+	}
+	if len(dynamic) == 0 {
+		return h.replacer.Replace(s)
+	}
+	pairs := append([]string(nil), h.baseMask...)
+	for _, v := range dynamic {
+		pairs = actrunner.AppendSecretMasker(pairs, v)
+	}
+	return strings.NewReplacer(pairs...).Replace(s)
+}
+
+// addMaskLine matches the command a job uses to declare a new secret. The line
+// itself carries the value, and it reaches this hook before act has had a
+// chance to add it to the mask list — so the one line that announces a secret
+// would be the one line that prints it.
+var addMaskLine = regexp.MustCompile(`(?i)(::add-mask::|##\[add-mask\])\s*\S.*`)
+
+func redactAddMask(s string) string {
+	return addMaskLine.ReplaceAllStringFunc(s, func(m string) string {
+		if i := strings.Index(strings.ToLower(m), "::add-mask::"); i >= 0 {
+			return m[:i] + "::add-mask::***"
+		}
+		return "##[add-mask]***"
+	})
 }
 
 func (h *actHook) Levels() []logrus.Level { return logrus.AllLevels }
@@ -423,6 +472,7 @@ func (h *actHook) Fire(entry *logrus.Entry) error {
 	if msg == "" {
 		return nil
 	}
+	msg = h.mask(entry, redactAddMask(msg))
 	if raw, _ := entry.Data["raw_output"].(bool); raw {
 		h.logs.write(msg)
 		return nil
