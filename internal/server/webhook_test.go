@@ -525,3 +525,78 @@ func TestSchedulerAdvancesBeforeItStarts(t *testing.T) {
 		t.Errorf("the schedule is still due after firing: %+v", due)
 	}
 }
+
+const issueWorkflow = `
+name: On Issues
+on:
+  issues:
+    types: [opened, labeled]
+jobs:
+  triage:
+    runs-on: [self-hosted]
+    steps:
+      - run: echo ${{ github.event.issue.number }}
+`
+
+// Most events carry no commit — issues, issue_comment, release, label. GitHub
+// runs their workflows from the default branch; bailing out instead is how
+// `on: issues` silently never fires.
+func TestEventsWithoutACommitRunFromTheDefaultBranch(t *testing.T) {
+	hs, st, _ := webhookServer(t, issueWorkflow)
+	payload := map[string]any{
+		"action":     "opened",
+		"repository": map[string]any{"full_name": "feed-mob/app", "default_branch": "main"},
+		"sender":     map[string]any{"login": "someone"},
+		"issue":      map[string]any{"number": 7, "title": "broken"},
+	}
+	code, body := deliver(t, hs.URL, "issues", "d1", payload, true)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d (%v)", code, body)
+	}
+	runs, _ := st.ListRuns(t.Context(), 10)
+	if len(runs) != 1 {
+		t.Fatalf("an issues event produced %d runs, want 1", len(runs))
+	}
+	if runs[0].Event != "issues" || runs[0].SHA != "main" {
+		t.Errorf("run = %+v; workflows should be read from the default branch", runs[0])
+	}
+	// The event itself has to reach the job, or `github.event.issue.number`
+	// resolves to nothing.
+	meta, _ := st.RunMeta(t.Context(), runs[0].ID)
+	if !strings.Contains(meta.EventPayload, `"number":7`) {
+		t.Errorf("event payload lost the issue: %s", meta.EventPayload)
+	}
+}
+
+// An activity type the workflow did not ask for must not fire it.
+func TestIssueActivityTypesAreHonoured(t *testing.T) {
+	hs, st, _ := webhookServer(t, issueWorkflow)
+	payload := map[string]any{
+		"action":     "closed",
+		"repository": map[string]any{"full_name": "feed-mob/app", "default_branch": "main"},
+		"sender":     map[string]any{"login": "someone"},
+		"issue":      map[string]any{"number": 7},
+	}
+	if code, _ := deliver(t, hs.URL, "issues", "d1", payload, true); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	if runs, _ := st.ListRuns(t.Context(), 10); len(runs) != 0 {
+		t.Errorf("`types: [opened, labeled]` ran on a closed event")
+	}
+}
+
+// A repository with no default branch and no commit has nothing to read.
+func TestEventWithNothingToReadFromIsIgnored(t *testing.T) {
+	hs, st, _ := webhookServer(t, issueWorkflow)
+	payload := map[string]any{
+		"action":     "opened",
+		"repository": map[string]any{"full_name": "feed-mob/app"},
+		"sender":     map[string]any{"login": "someone"},
+	}
+	if code, _ := deliver(t, hs.URL, "issues", "d1", payload, true); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	if runs, _ := st.ListRuns(t.Context(), 10); len(runs) != 0 {
+		t.Errorf("created %d runs with nothing to read a workflow from", len(runs))
+	}
+}

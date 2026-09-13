@@ -1,0 +1,26 @@
+# 可复用 workflow：只能被别的 workflow 调用（workflow_call），自己不会因为任何事件运行。
+# 章程里"8 个仓库重复的部署抽成一份"要的就是这个形状。
+name: Reusable Deploy
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: 部署目标
+        type: string
+        required: true
+      version:
+        type: string
+        default: latest
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: [self-hosted]
+    timeout-minutes: 5
+    steps:
+      - name: Pretend to deploy
+        run: |
+          echo "REUSABLE WORKFLOW RAN"
+          echo "target  = ${{ inputs.target }}"
+          echo "version = ${{ inputs.version }}"

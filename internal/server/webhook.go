@@ -156,6 +156,10 @@ func (s *Server) dispatchEvent(ctx context.Context, event string, body []byte) (
 
 	ev, sha := eventFor(event, &p)
 	if sha == "" {
+		// Nothing to read a workflow from: neither a commit nor a default
+		// branch. A repository in that state has no workflows to run.
+		s.log.Warn("event carries no commit and the repository reports no default branch",
+			"repo", p.Repository.FullName, "event", event)
 		return nil, nil
 	}
 	var raw map[string]any
@@ -226,6 +230,17 @@ func eventFor(event string, p *hookPayload) (workflow.Event, string) {
 			ev.Paths = append(ev.Paths, c.Added...)
 			ev.Paths = append(ev.Paths, c.Modified...)
 			ev.Paths = append(ev.Paths, c.Removed...)
+		}
+	}
+	if sha == "" {
+		// Most events carry no commit: issues, issue_comment, release, label,
+		// deployment. GitHub runs their workflows from the default branch, and
+		// so do we — bailing out instead is how `on: issues` silently never
+		// fires. The ref follows, so `branches:` filters on such an event mean
+		// what an author would expect.
+		sha = p.Repository.DefaultBranch
+		if ev.Ref == "" && sha != "" {
+			ev.Ref = "refs/heads/" + sha
 		}
 	}
 	return ev, sha

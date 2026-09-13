@@ -1,0 +1,17 @@
+# 调用上面那份可复用 workflow。只能手动触发，不会因为提交而自动运行。
+name: Call Reusable (demo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        type: choice
+        options: [staging, production]
+        required: true
+
+jobs:
+  call:
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      target: ${{ inputs.target }}
+      version: v9.9.9
