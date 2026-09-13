@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orrery</title>
+<style>
+/* No CDN anywhere on purpose: a runner host with no egress still has to be
+   able to open this page, and a build server that phones out to render its own
+   dashboard is a dependency nobody signed up for. */
+:root {
+  --bg: #fbfbfa; --panel: #fff; --line: #e3e1dd; --ink: #22201d; --dim: #6f6a63;
+  --accent: #1f5f3f; --ok: #1a7f43; --fail: #b4322c; --warn: #a8690a; --idle: #6f6a63;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16151a; --panel: #1e1d23; --line: #33313a; --ink: #e8e6e3; --dim: #99938c;
+    --accent: #5fbf8f; --ok: #4cb872; --fail: #e06c65; --warn: #d99a3b; --idle: #99938c;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+header {
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+  position: sticky; top: 0; z-index: 5;
+}
+header h1 { margin: 0; font-size: 17px; letter-spacing: .04em; }
+header h1 a { color: var(--accent); text-decoration: none; }
+header .sub { color: var(--dim); font-size: 13px; }
+header .spacer { flex: 1; }
+main { max-width: 1080px; margin: 0 auto; padding: 20px; }
+a { color: var(--accent); }
+/* Wide content scrolls inside its own box; the page body never does. */
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); font-weight: 600; }
+tbody tr:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.card + .card { margin-top: 16px; }
+.card > h2 {
+  margin: 0; padding: 12px 14px; font-size: 13px; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 10px;
+}
+.card > h2 .spacer { flex: 1; }
+.badge {
+  display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px;
+  border: 1px solid currentColor; white-space: nowrap;
+}
+.ok { color: var(--ok); } .fail { color: var(--fail); }
+.warn { color: var(--warn); } .idle { color: var(--dim); }
+.run-line { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.mono { font-family: var(--mono); font-size: 13px; }
+.dim { color: var(--dim); }
+button {
+  font: inherit; font-size: 13px; padding: 4px 12px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+.steps { margin: 0; padding: 0; list-style: none; }
+.steps li {
+  display: flex; gap: 10px; align-items: baseline;
+  padding: 6px 14px; border-top: 1px solid var(--line); font-size: 14px;
+}
+.steps li .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+pre.log {
+  margin: 0; padding: 12px 14px; max-height: 60vh; overflow: auto;
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word; background: var(--panel);
+}
+pre.log .t { color: var(--dim); }
+pre.log .err { color: var(--fail); }
+pre.log .grp { color: var(--accent); }
+.empty { padding: 28px 14px; text-align: center; color: var(--dim); }
+/* On a phone the secondary columns are what you scroll past to reach the
+   verdict, so drop them rather than make the whole table slide. */
+@media (max-width: 720px) {
+  .secondary { display: none; }
+  main { padding: 12px; }
+  th, td { padding: 8px 6px; }
+  .card > h2 { flex-wrap: wrap; }
+}
+.err-banner { color: var(--fail); padding: 10px 14px; border-bottom: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="#/">ORRERY</a></h1>
+  <span class="sub" id="crumb"></span>
+  <span class="spacer"></span>
+  <span class="sub" id="tick"></span>
+</header>
+<main id="app"><div class="empty">加载中…</div></main>
+<script src="app.js"></script>
+</body>
+</html>

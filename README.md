@@ -157,6 +157,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **状态回写**（#47） | ✅ Commit Status API，`orrery / <workflow>`；入队 pending、落定终态 |
 | **产物与缓存**（#27 #28） | ✅ runner 内置产物与缓存服务端；跨 job 传产物已验证。**必须钉 v3**，见下 |
 | **job 级 `if:`** | ✅ `always()` / `failure()` / `cancelled()` 与任意表达式，用 act 自己的解释器求值 |
+| **Web UI**（#32） | ✅ 编译进二进制，无 CDN；run 列表、步骤时间线、日志、重跑、停止；深色与手机适配 |
 | **重跑**（#53） | ✅ `rerun [--failed]`：run 保持不变、attempt +1；成功 job 的产物与 outputs 留着给被重跑的用 |
 | `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
 
@@ -191,6 +192,16 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 installation token 能创建**，PAT 和 OAuth token 一律被拒。Commit Status 任何能写
 仓库的 token 都能用，分支保护的 required checks 同样认它。等 Orrery 有了自己的
 GitHub App，再升级到 Checks API 拿 diff 行内注解。
+
+### Web UI
+
+`orrery-server` 起来之后直接打开 `http://<addr>/`。页面**编译进二进制**，不读磁盘上的
+资源目录，也**不连任何 CDN**——一台没有出网的 runner 主机也要能打开它，而一个要连
+互联网才能画出自己面板的控制面，是没人签字同意过的依赖。
+
+run 列表 → run 详情（每个 job 的步骤时间线、耗时、日志区间）→ 展开日志（`::error::`
+标红、`::group::` 标色、时间戳压暗）。重跑和停止就在页面上。只在有东西真的在动的时候
+才轮询——没人看的时候还在敲自己控制面的面板，本身就是一次故障。
 
 ### 重跑
 

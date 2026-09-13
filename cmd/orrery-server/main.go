@@ -114,6 +114,7 @@ func main() {
 		"forge_token", *forgeToken != "", "webhooks", *hookSecret != "",
 		"default_concurrency", *defaultConc,
 		"secrets", keysOf(secrets))
+	log.Info("dashboard", "url", orDefault(*publicURL, "http://"+strings.TrimPrefix(*addr, ":")+"/"))
 	if *hookSecret == "" {
 		log.Warn("webhook endpoint disabled: set -webhook-secret to accept forge events")
 	}
@@ -153,6 +154,13 @@ func loadSecrets(path string) (map[string]string, error) {
 		out[k] = v
 	}
 	return out, nil
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }
 
 func envWithPrefix(prefix string) map[string]string {

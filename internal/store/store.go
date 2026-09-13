@@ -383,6 +383,8 @@ type Job struct {
 	StopAckedAt     *time.Time
 	ForceTerminated bool
 	CleanupRan      bool
+	// Attempt is which re-run of this job the current state belongs to.
+	Attempt int64
 	// Steps is filled by the readers that return a whole run; the dispatch path
 	// leaves it nil, because a runner claiming work has no use for it.
 	Steps []StepReport

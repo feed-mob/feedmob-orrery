@@ -14,7 +14,7 @@ func (s *Store) JobByID(ctx context.Context, id int64) (*Job, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, run_id, job_key, name, needs, runs_on, payload, status, result, timeout_minutes,
 		       runner_id, started_at, stopped_at, stop_requested_at, stop_reason, stop_acked_at,
-		       force_terminated, cleanup_ran
+		       force_terminated, cleanup_ran, attempt
 		FROM jobs WHERE id = ?`, id)
 	return scanJob(row)
 }
@@ -30,7 +30,8 @@ func scanJob(row rowScanner) (*Job, error) {
 	var started, stopped, stopReq, stopAck sql.NullString
 	var force, cleanup int
 	err := row.Scan(&j.ID, &j.RunID, &j.Key, &j.Name, &needs, &runsOn, &j.Payload, &j.Status, &j.Result,
-		&j.TimeoutMinutes, &runnerID, &started, &stopped, &stopReq, &j.StopReason, &stopAck, &force, &cleanup)
+		&j.TimeoutMinutes, &runnerID, &started, &stopped, &stopReq, &j.StopReason, &stopAck, &force, &cleanup,
+		&j.Attempt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -502,7 +503,8 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
 		limit = 20
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at
+		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at,
+		       run_number, run_attempt
 		FROM runs ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -513,7 +515,7 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
 		var r Run
 		var created string
 		if err := rows.Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile, &r.Event, &r.Ref, &r.SHA,
-			&r.Actor, &r.Status, &r.Result, &created); err != nil {
+			&r.Actor, &r.Status, &r.Result, &created, &r.RunNumber, &r.RunAttempt); err != nil {
 			return nil, err
 		}
 		r.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
@@ -543,7 +545,7 @@ func (s *Store) RunByID(ctx context.Context, id int64) (*RunSummary, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, run_id, job_key, name, needs, runs_on, payload, status, result, timeout_minutes,
 		       runner_id, started_at, stopped_at, stop_requested_at, stop_reason, stop_acked_at,
-		       force_terminated, cleanup_ran
+		       force_terminated, cleanup_ran, attempt
 		FROM jobs WHERE run_id = ? ORDER BY id ASC`, id)
 	if err != nil {
 		return nil, err

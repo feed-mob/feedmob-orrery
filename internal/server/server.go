@@ -163,6 +163,8 @@ func (s *Server) routes() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	// Last, so it only catches what the API did not.
+	s.mux.Handle("GET /", s.uiHandler())
 }
 
 // ------------------------------------------------------------------ plumbing
