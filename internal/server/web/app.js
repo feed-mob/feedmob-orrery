@@ -235,12 +235,37 @@ function emptyReason(j) {
   return '还没有步骤';
 }
 
+// MAX_RENDERED_LINES bounds what goes into the DOM. A verbose build prints
+// tens of thousands of lines, and each one here is three nodes; past roughly
+// 80k lines the browser gives up entirely and the panel shows nothing. The tail
+// is the part anyone opening a log actually wants, and the whole thing is one
+// click away as plain text.
+const MAX_RENDERED_LINES = 5000;
+
 async function loadLog(j, box) {
   try {
     const res = await fetch('/api/jobs/' + j.ID + '/logs');
     if (res.status === 401) { renderSignIn(); return; }
     const text = await res.text();
-    box.replaceChildren(...colourise(text));
+    const all = text.split('\n');
+    // A trailing newline leaves an empty last element; dropping it keeps the
+    // "showing the last N of M" count honest.
+    if (all.length && all[all.length - 1] === '') all.pop();
+
+    const shown = all.length > MAX_RENDERED_LINES ? all.slice(-MAX_RENDERED_LINES) : all;
+    const frag = document.createDocumentFragment();
+    if (shown.length < all.length) {
+      frag.append(el('span', { class: 'dim' },
+        `… 前 ${all.length - shown.length} 行已省略，共 ${all.length} 行。`),
+        el('a', { href: '/api/jobs/' + j.ID + '/logs', target: '_blank' }, '看完整日志'),
+        document.createTextNode('\n\n'));
+    }
+    // Appended one at a time rather than spread into replaceChildren: spreading
+    // a few hundred thousand arguments overflows the call stack, which is how
+    // this used to fail — with an empty panel and a RangeError in the console.
+    for (const node of colourise(shown)) frag.append(node);
+    box.replaceChildren(frag);
+
     // Only pin to the bottom while the job is still producing output;
     // yanking the view down under someone reading a finished log is rude.
     if (j.Status === 'running') box.scrollTop = box.scrollHeight;
@@ -251,9 +276,9 @@ async function loadLog(j, box) {
 
 // colourise keeps the workflow-command markers legible instead of stripping
 // them: `::error::` is how a step says what went wrong.
-function colourise(text) {
+function colourise(lines) {
   const out = [];
-  for (const line of text.split('\n')) {
+  for (const line of lines) {
     if (!line) { out.push(document.createTextNode('\n')); continue; }
     const m = line.match(/^(\S+Z)\s([\s\S]*)$/);
     const stamp = m ? m[1] : '';
