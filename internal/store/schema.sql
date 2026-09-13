@@ -52,7 +52,10 @@ CREATE TABLE IF NOT EXISTS runs (
     result        TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL,
     started_at    TEXT,
-    stopped_at    TEXT
+    stopped_at    TEXT,
+    -- The forge event verbatim. It becomes `github.event`, so a workflow can
+    -- read fields this server has never heard of, and a run can be replayed.
+    event_payload TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (status);
@@ -122,3 +125,16 @@ CREATE TABLE IF NOT EXISTS job_log_state (
     ack_index INTEGER NOT NULL DEFAULT 0,
     no_more   INTEGER NOT NULL DEFAULT 0
 );
+
+-- Webhook deliveries we have already acted on.
+--
+-- GitHub redelivers on timeout and on a manual redeliver, and a redelivered
+-- push must not build twice. The delivery id is the only stable identity a
+-- webhook carries, so it is the idempotency key.
+CREATE TABLE IF NOT EXISTS deliveries (
+    id          TEXT PRIMARY KEY,
+    event       TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_received ON deliveries (received_at);

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/feed-mob/feedmob-orrery/internal/forge"
 	"github.com/feed-mob/feedmob-orrery/internal/protocol"
 	"github.com/feed-mob/feedmob-orrery/internal/store"
 	"github.com/feed-mob/feedmob-orrery/internal/workflow"
@@ -44,6 +45,18 @@ type Config struct {
 	// `uses:` resolves from (the runner's -actions-url), because a repository
 	// and the action registry need not be the same host.
 	Forge Forge
+	// ForgeToken authenticates reads of workflow files and writes of commit
+	// statuses. Without it Orrery can still run what the CLI hands it, and
+	// cannot be triggered by a private repository or report back to one.
+	ForgeToken string
+	// WebhookSecret is the shared secret GitHub signs deliveries with. An empty
+	// one disables the webhook endpoint outright rather than accepting unsigned
+	// events: an unauthenticated trigger is a way to run arbitrary workflows
+	// with whatever secrets this server injects.
+	WebhookSecret string
+	// PublicURL is where a human can reach this server, used as the target of
+	// commit statuses. Empty means the status links nowhere.
+	PublicURL string
 }
 
 // Forge is the code host a run belongs to.
@@ -94,17 +107,21 @@ func (c *Config) withDefaults() {
 
 // Server wires the store to HTTP.
 type Server struct {
-	st   *store.Store
-	cfg  Config
-	log  *slog.Logger
-	mux  *http.ServeMux
-	wake *notifier
+	st    *store.Store
+	cfg   Config
+	log   *slog.Logger
+	mux   *http.ServeMux
+	wake  *notifier
+	forge *forge.Client
 }
 
 // New builds a server.
 func New(st *store.Store, cfg Config, log *slog.Logger) *Server {
 	cfg.withDefaults()
-	s := &Server{st: st, cfg: cfg, log: log, mux: http.NewServeMux(), wake: newNotifier()}
+	s := &Server{
+		st: st, cfg: cfg, log: log, mux: http.NewServeMux(), wake: newNotifier(),
+		forge: forge.New(cfg.Forge.APIURL, cfg.ForgeToken),
+	}
 	s.routes()
 	return s
 }
@@ -119,6 +136,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"UpdateTask", s.authed(s.handleUpdateTask))
 	s.mux.HandleFunc("POST "+p+"UpdateLog", s.authed(s.handleUpdateLog))
 
+	s.mux.HandleFunc("POST /api/webhooks/github", s.handleGitHubWebhook)
 	s.mux.HandleFunc("POST /api/runs", s.handleSubmitRun)
 	s.mux.HandleFunc("GET /api/runs", s.handleListRuns)
 	s.mux.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
@@ -333,15 +351,44 @@ func (s *Server) tryClaim(ctx context.Context, runner *store.Runner) (*protocol.
 			"actor":      run.Actor,
 			"event_name": run.Event,
 			"workflow":   run.WorkflowName,
-			"token":      s.cfg.Secrets["GITHUB_TOKEN"],
+			"token":      s.forgeToken(),
 
 			"server_url":  s.cfg.Forge.URL,
 			"api_url":     s.cfg.Forge.APIURL,
 			"graphql_url": s.cfg.Forge.GraphQLURL,
+
+			// `github.event` — the forge's payload verbatim, so a workflow can
+			// read `github.event.pull_request.number` and everything else we
+			// never modelled.
+			"event": decodeEvent(run.EventPayload),
 		},
 		Secrets: s.cfg.Secrets,
 		Vars:    s.cfg.Vars,
 	}, version, nil
+}
+
+// forgeToken is what a task gets as `github.token`. An explicitly configured
+// GITHUB_TOKEN secret wins, so an operator can hand jobs a narrower credential
+// than the one this server uses to read workflows and write statuses.
+func (s *Server) forgeToken() string {
+	if v := s.cfg.Secrets["GITHUB_TOKEN"]; v != "" {
+		return v
+	}
+	return s.cfg.ForgeToken
+}
+
+// decodeEvent turns the stored payload back into a map. A payload we cannot
+// read becomes an empty event rather than a failed dispatch: `github.event`
+// resolving to nothing is recoverable, a job that never starts is not.
+func decodeEvent(payload string) map[string]any {
+	if payload == "" {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(payload), &out); err != nil {
+		return map[string]any{}
+	}
+	return out
 }
 
 // handleUpdateTask records progress. The reply carries StopRequested, which is
@@ -399,11 +446,13 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.State.Result.Done() {
-		if err := s.st.FinishJob(ctx, jobID, string(req.State.Result)); err != nil {
+		outcome, err := s.st.FinishJob(ctx, jobID, string(req.State.Result))
+		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		s.log.Info("task finished", "job", jobID, "result", req.State.Result)
+		s.announce(ctx, outcome)
 		s.wake.broadcast()
 	}
 
@@ -467,18 +516,10 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	jobs := make([]store.NewJob, 0, len(wf.JobOrder))
-	for _, key := range wf.JobOrder {
-		j := wf.Jobs[key]
-		payload, err := wf.JobPayload([]byte(req.Workflow), key)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		jobs = append(jobs, store.NewJob{
-			Key: key, Name: j.Name, Needs: j.Needs, RunsOn: j.RunsOn,
-			Payload: string(payload), TimeoutMinutes: j.TimeoutMinutes,
-		})
+	jobs, err := newJobsFor(wf, []byte(req.Workflow))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	run := store.Run{
 		Repo: req.Repo, WorkflowName: wf.Name, WorkflowFile: req.WorkflowFile,
@@ -495,6 +536,24 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("run created", "run", runID, "workflow", wf.Name,
 		"jobs", len(jobs), "actions", wf.UsedActions())
 	writeJSON(w, http.StatusOK, SubmitResponse{RunID: runID, Jobs: wf.JobOrder})
+}
+
+// newJobsFor turns a parsed workflow into the jobs a run is made of, each
+// carrying its own trimmed payload.
+func newJobsFor(wf *workflow.Workflow, source []byte) ([]store.NewJob, error) {
+	jobs := make([]store.NewJob, 0, len(wf.JobOrder))
+	for _, key := range wf.JobOrder {
+		j := wf.Jobs[key]
+		payload, err := wf.JobPayload(source, key)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, store.NewJob{
+			Key: key, Name: j.Name, Needs: j.Needs, RunsOn: j.RunsOn,
+			Payload: string(payload), TimeoutMinutes: j.TimeoutMinutes,
+		})
+	}
+	return jobs, nil
 }
 
 func orDefault(v, def string) string {
@@ -597,11 +656,13 @@ func (s *Server) RunReaper(ctx context.Context) {
 				}
 				s.log.Warn("job past timeout, stop requested", "job", o.ID)
 			case "stop_unacked":
-				if err := s.st.ForceTerminate(ctx, o.ID, "timeout"); err != nil {
+				outcome, err := s.st.ForceTerminate(ctx, o.ID, "timeout")
+				if err != nil {
 					s.log.Error("reaper force terminate failed", "job", o.ID, "err", err)
 					continue
 				}
 				s.log.Warn("stop never acknowledged, force terminated", "job", o.ID, "cleanup_ran", false)
+				s.announce(ctx, outcome)
 				s.wake.broadcast()
 			}
 		}

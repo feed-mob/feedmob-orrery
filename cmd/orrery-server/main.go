@@ -28,6 +28,9 @@ func main() {
 		secretsFile = flag.String("secrets", "", "optional KEY=VALUE file injected into every task; values are never persisted")
 		forgeURL    = flag.String("forge-url", "https://github.com", "where the code being built lives; becomes github.server_url, which actions/checkout clones from")
 		forgeAPI    = flag.String("forge-api-url", "", "forge REST API root; derived from -forge-url when empty (api.github.com for github.com, else <forge>/api/v3 — a Gitea forge must set /api/v1 here)")
+		forgeToken  = flag.String("forge-token", os.Getenv("ORRERY_FORGE_TOKEN"), "token used to read workflow files and write commit statuses; without it webhooks cannot read a private repo and results are not reported back")
+		hookSecret  = flag.String("webhook-secret", os.Getenv("ORRERY_WEBHOOK_SECRET"), "shared secret GitHub signs webhook deliveries with; empty disables the webhook endpoint")
+		publicURL   = flag.String("public-url", os.Getenv("ORRERY_PUBLIC_URL"), "where humans reach this server; used as the target of commit statuses")
 		verbose     = flag.Bool("v", false, "debug logging")
 	)
 	flag.Parse()
@@ -61,6 +64,9 @@ func main() {
 		Secrets:           secrets,
 		Vars:              envWithPrefix("ORRERY_VAR_"),
 		Forge:             server.Forge{URL: *forgeURL, APIURL: *forgeAPI},
+		ForgeToken:        *forgeToken,
+		WebhookSecret:     *hookSecret,
+		PublicURL:         *publicURL,
 	}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -81,8 +87,18 @@ func main() {
 	}()
 
 	// Names only — a log line that echoes a secret is a leaked secret.
+	// Names and booleans only — a log line that echoes a secret is a leaked
+	// secret, and that includes the forge token and the webhook secret.
 	log.Info("orrery server listening", "addr", *addr, "db", *dbPath,
-		"stop_grace", *grace, "forge", *forgeURL, "secrets", keysOf(secrets))
+		"stop_grace", *grace, "forge", *forgeURL,
+		"forge_token", *forgeToken != "", "webhooks", *hookSecret != "",
+		"secrets", keysOf(secrets))
+	if *hookSecret == "" {
+		log.Warn("webhook endpoint disabled: set -webhook-secret to accept forge events")
+	}
+	if *forgeToken == "" {
+		log.Warn("no forge token: results will not be reported back to the forge")
+	}
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("serve", "err", err)
 		os.Exit(1)

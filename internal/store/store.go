@@ -42,7 +42,41 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	if err := addColumns(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{db: db, now: time.Now}, nil
+}
+
+// addColumns brings a database created by an earlier build up to date.
+//
+// The schema is all CREATE TABLE IF NOT EXISTS, so a table that already exists
+// is left exactly as it was — a column added to the schema later would never
+// appear in it. These run every open and are no-ops once applied.
+func addColumns(db *sql.DB) error {
+	for _, stmt := range []string{
+		`ALTER TABLE runs ADD COLUMN event_payload TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("%s: %w", stmt, err)
+		}
+	}
+	return nil
+}
+
+// ClaimDelivery records a webhook delivery and reports whether it is new.
+// A repeat returns false, which is how a redelivered push avoids building a
+// second time.
+func (s *Store) ClaimDelivery(ctx context.Context, id, event string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO deliveries (id, event, received_at) VALUES (?, ?, ?)`,
+		id, event, ts(s.now()))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -212,6 +246,10 @@ type Run struct {
 	Status       string
 	Result       string
 	CreatedAt    time.Time
+	// EventPayload is the forge event verbatim, which becomes `github.event`.
+	// Storing it rather than a summary is what lets a workflow read fields we
+	// have never heard of, and lets a run be replayed later.
+	EventPayload string
 }
 
 // Job is a stored job.
@@ -253,9 +291,10 @@ func (s *Store) CreateRun(ctx context.Context, run Run, jobs []NewJob) (int64, e
 
 	now := ts(s.now())
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO runs (repo, workflow_name, workflow_file, event, ref, sha, actor, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
-		run.Repo, run.WorkflowName, run.WorkflowFile, run.Event, run.Ref, run.SHA, run.Actor, now)
+		INSERT INTO runs (repo, workflow_name, workflow_file, event, ref, sha, actor, status, created_at, event_payload)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+		run.Repo, run.WorkflowName, run.WorkflowFile, run.Event, run.Ref, run.SHA, run.Actor, now,
+		run.EventPayload)
 	if err != nil {
 		return 0, fmt.Errorf("insert run: %w", err)
 	}

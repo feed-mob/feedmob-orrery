@@ -113,61 +113,75 @@ func (s *Store) SetSteps(ctx context.Context, jobID int64, steps []StepReport) e
 // dependents whose needs are now all satisfied move to 'queued'; dependents of a
 // failed or cancelled job are cancelled themselves rather than left blocked
 // forever.
-func (s *Store) FinishJob(ctx context.Context, jobID int64, result string) error {
+func (s *Store) FinishJob(ctx context.Context, jobID int64, result string) (*RunOutcome, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 
 	now := ts(s.now())
 	var runID int64
 	if err := tx.QueryRowContext(ctx, `SELECT run_id FROM jobs WHERE id = ?`, jobID).Scan(&runID); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET status = 'done', result = ?, stopped_at = COALESCE(stopped_at, ?) WHERE id = ?`,
 		result, now, jobID); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE runners SET status = 'idle' WHERE id = (SELECT runner_id FROM jobs WHERE id = ?)`, jobID); err != nil {
-		return err
+		return nil, err
 	}
-	if err := propagate(ctx, tx, runID, now); err != nil {
-		return err
+	outcome, err := propagate(ctx, tx, runID, now)
+	if err != nil {
+		return nil, err
 	}
 	if err := bumpTasksVersion(ctx, tx); err != nil {
-		return err
+		return nil, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	// Only report after the commit: telling the forge a run passed and then
+	// rolling the transaction back would leave the two disagreeing, with the
+	// forge's copy the one people act on.
+	return outcome, nil
+}
+
+// RunOutcome is a run that has just settled. FinishJob returns nil when the run
+// still has jobs in flight, so a caller can report a verdict exactly once.
+type RunOutcome struct {
+	RunID  int64
+	Result string
 }
 
 // propagate walks the run's blocked jobs and moves each one forward once its
 // upstreams have settled.
-func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string) error {
+func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string) (*RunOutcome, error) {
 	results := map[string]string{}
 	statuses := map[string]string{}
 	rows, err := tx.QueryContext(ctx, `SELECT job_key, status, result FROM jobs WHERE run_id = ?`, runID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for rows.Next() {
 		var k, st, res string
 		if err := rows.Scan(&k, &st, &res); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		statuses[k], results[k] = st, res
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
 	blocked, err := tx.QueryContext(ctx, `SELECT id, job_key, needs FROM jobs WHERE run_id = ? AND status = 'blocked'`, runID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	type pending struct {
 		id    int64
@@ -179,13 +193,13 @@ func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string) error {
 		var key, needsRaw string
 		if err := blocked.Scan(&id, &key, &needsRaw); err != nil {
 			blocked.Close()
-			return err
+			return nil, err
 		}
 		list = append(list, pending{id: id, needs: decodeStrings(needsRaw)})
 	}
 	blocked.Close()
 	if err := blocked.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, p := range list {
@@ -208,29 +222,29 @@ func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string) error {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE jobs SET status = 'done', result = 'skipped', stop_reason = 'upstream_failed',
 				                stopped_at = ? WHERE id = ?`, now, p.id); err != nil {
-				return err
+				return nil, err
 			}
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET status = 'queued' WHERE id = ?`, p.id); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	// Settle the run once nothing is left in flight.
 	var open int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id = ? AND status != 'done'`, runID).Scan(&open); err != nil {
-		return err
+		return nil, err
 	}
 	if open > 0 {
-		return nil
+		return nil, nil
 	}
 	var failed, cancelled int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id = ? AND result = 'failure'`, runID).Scan(&failed); err != nil {
-		return err
+		return nil, err
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id = ? AND result = 'cancelled'`, runID).Scan(&cancelled); err != nil {
-		return err
+		return nil, err
 	}
 	result := "success"
 	switch {
@@ -239,8 +253,12 @@ func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string) error {
 	case cancelled > 0:
 		result = "cancelled"
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE runs SET status = 'done', result = ?, stopped_at = ? WHERE id = ?`, result, now, runID)
-	return err
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE runs SET status = 'done', result = ?, stopped_at = ? WHERE id = ?`,
+		result, now, runID); err != nil {
+		return nil, err
+	}
+	return &RunOutcome{RunID: runID, Result: result}, nil
 }
 
 // ------------------------------------------------------------------ stops --
@@ -274,11 +292,11 @@ func (s *Store) AckStop(ctx context.Context, jobID int64, at time.Time) error {
 // ForceTerminate gives up waiting for an ack. The job is marked cancelled with
 // cleanup_ran left at 0, so the ledger says plainly that whatever the job was
 // holding was never released.
-func (s *Store) ForceTerminate(ctx context.Context, jobID int64, reason string) error {
+func (s *Store) ForceTerminate(ctx context.Context, jobID int64, reason string) (*RunOutcome, error) {
 	if _, err := s.db.ExecContext(ctx, `
 		UPDATE jobs SET force_terminated = 1, stop_reason = CASE WHEN stop_reason = '' THEN ? ELSE stop_reason END
 		WHERE id = ?`, reason, jobID); err != nil {
-		return err
+		return nil, err
 	}
 	return s.FinishJob(ctx, jobID, "cancelled")
 }
@@ -428,9 +446,10 @@ func (s *Store) RunMeta(ctx context.Context, runID int64) (*Run, error) {
 	var r Run
 	var created string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at
+		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at,
+		       event_payload
 		FROM runs WHERE id = ?`, runID).Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile, &r.Event,
-		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created)
+		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created, &r.EventPayload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

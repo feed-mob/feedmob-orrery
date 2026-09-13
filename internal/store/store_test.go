@@ -141,7 +141,7 @@ func TestFinishJobUnblocksDependentsAndSettlesTheRun(t *testing.T) {
 			testID = j.ID
 		}
 	}
-	if err := st.FinishJob(ctx, buildID, "success"); err != nil {
+	if _, err := st.FinishJob(ctx, buildID, "success"); err != nil {
 		t.Fatalf("finish build: %v", err)
 	}
 	sum, _ = st.RunByID(ctx, runID)
@@ -150,7 +150,7 @@ func TestFinishJobUnblocksDependentsAndSettlesTheRun(t *testing.T) {
 			t.Fatalf("test status = %q, want queued once build succeeded", j.Status)
 		}
 	}
-	if err := st.FinishJob(ctx, testID, "success"); err != nil {
+	if _, err := st.FinishJob(ctx, testID, "success"); err != nil {
 		t.Fatalf("finish test: %v", err)
 	}
 	sum, _ = st.RunByID(ctx, runID)
@@ -173,7 +173,7 @@ func TestFailedUpstreamSkipsDependentsInsteadOfBlockingForever(t *testing.T) {
 			buildID = j.ID
 		}
 	}
-	if err := st.FinishJob(ctx, buildID, "failure"); err != nil {
+	if _, err := st.FinishJob(ctx, buildID, "failure"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	sum, _ = st.RunByID(ctx, runID)
@@ -215,7 +215,7 @@ func TestAcknowledgedStopRecordsThatCleanupRan(t *testing.T) {
 	if pending, _ = st.StopPending(ctx, id); pending {
 		t.Error("StopPending still true after the runner acknowledged")
 	}
-	if err := st.FinishJob(ctx, id, "cancelled"); err != nil {
+	if _, err := st.FinishJob(ctx, id, "cancelled"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	job, _ := st.JobByID(ctx, id)
@@ -234,7 +234,7 @@ func TestForceTerminateRecordsThatCleanupDidNotRun(t *testing.T) {
 	if err := st.RequestStop(ctx, id, "reaper", "timeout"); err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	if err := st.ForceTerminate(ctx, id, "timeout"); err != nil {
+	if _, err := st.ForceTerminate(ctx, id, "timeout"); err != nil {
 		t.Fatalf("force: %v", err)
 	}
 	job, _ := st.JobByID(ctx, id)
@@ -346,7 +346,7 @@ func TestNeedsContextCarriesUpstreamOutputs(t *testing.T) {
 	if _, err := st.SetOutputs(ctx, buildID, map[string]string{"artifact": "app.tar"}); err != nil {
 		t.Fatalf("outputs: %v", err)
 	}
-	if err := st.FinishJob(ctx, buildID, "success"); err != nil {
+	if _, err := st.FinishJob(ctx, buildID, "success"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	outputs, results, err := st.NeedsContext(ctx, runID, []string{"build"})

@@ -140,8 +140,40 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | 表达式、`::group::`、`::error::`、矩阵、`services`、composite action | ✅ 由 act 承担（见 L2） |
 | 步骤时间线（名称 / 结果 / 耗时 / 日志区间） | ✅ 落库并在 CLI 展示 |
 | 密钥注入与作用域 | ✅ 派发时注入，不落库；日志只打印密钥名 |
-| 状态回写 GitHub Checks API（#47） | ⛔ 下一项，也是挂上现有 PR 流程的前提 |
+| **git 事件触发**（#1 #36 #38） | ✅ 签名校验的 GitHub webhook；按 delivery id 幂等；`branches` / `tags` / `paths` / `types` 过滤 |
+| **`github.event`** | ✅ 事件原文入库并注入，`${{ github.event.pull_request.number }}` 可用 |
+| **跨 job 传值**（#40） | ✅ `needs.<job>.outputs.*` 与 `needs.<job>.result` |
+| **状态回写**（#47） | ✅ Commit Status API，`orrery / <workflow>`；入队 pending、落定终态 |
 | 产物上传 / 下载、缓存 | ⛔ P1（act 自带本地服务端，协议不用重设计） |
+| job 级 `if:`（`always()` / `failure()`） | ⛔ 调度器目前把下游一律标 skipped |
+| `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
+
+### 接到 GitHub 上
+
+```bash
+./bin/orrery-server -db orrery.db \
+  -forge-token "$(gh auth token)" \        # 读 workflow 文件、回写状态
+  -webhook-secret "$(openssl rand -hex 32)" \
+  -public-url https://orrery.example.com \
+  -secrets secrets.env
+```
+
+仓库 Settings → Webhooks 里指向 `https://…/api/webhooks/github`，content type
+`application/json`，secret 填同一个值，勾选 push / pull request。
+
+- **触发**：webhook 到达 → 验签 → 按 delivery id 去重 → 在触发的那个 commit 上
+  读 `.github/workflows/` → 每个 `on:` 匹配的 workflow 起一个 run。
+  `pull_request` 读的是 PR head 的 workflow，所以 PR 可以改自己的 CI；
+  `pull_request_target` **不接受**（那是 pwn-request 向量，见 feature-inventory #39）。
+- **回写**：run 入队即写 `pending`，落定写 `success` / `failure` / `error`，
+  context 是 `orrery / <workflow 名>`——这就是分支保护里要勾的那个名字。
+- 没有 `-webhook-secret` 时 webhook 端点直接 503。**未签名的 webhook 端点等于
+  给任何能连到这个端口的人一次任意 workflow 执行**，还附带这台服务器注入的密钥。
+
+用 Commit Status 而不是 Checks API 是有意的：**check run 只有 GitHub App 的
+installation token 能创建**，PAT 和 OAuth token 一律被拒。Commit Status 任何能写
+仓库的 token 都能用，分支保护的 required checks 同样认它。等 Orrery 有了自己的
+GitHub App，再升级到 Checks API 拿 diff 行内注解。
 
 ### 两个已知缺口（不是疏忽，是已知边界）
 
@@ -176,6 +208,7 @@ internal/
   protocol/                runner.v1 线契约
   store/                   SQLite：runs / jobs / runners / logs
   server/                  HTTP 路由与回收器
+  forge/                   GitHub REST：读 workflow 文件、回写 commit status
   runner/                  取活循环、act 执行器、标签路由、日志发运
   workflow/                workflow YAML 解析与校验
 examples/
