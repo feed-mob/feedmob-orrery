@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -144,7 +145,7 @@ func main() {
 		"retention", *retention,
 		"auth", *apiToken != "",
 		"secrets", keysOf(secrets))
-	log.Info("dashboard", "url", orDefault(*publicURL, "http://"+strings.TrimPrefix(*addr, ":")+"/"))
+	log.Info("dashboard", "url", orDefault(*publicURL, dashboardURL(*addr)))
 	if *hookSecret == "" {
 		log.Warn("webhook endpoint disabled: set -webhook-secret to accept forge events")
 	}
@@ -188,6 +189,19 @@ func loadSecrets(path string) (map[string]string, error) {
 		out[k] = v
 	}
 	return out, nil
+}
+
+// dashboardURL turns a listen address into something clickable. ":8080" is a
+// valid address and "http://8080/" is not a URL.
+func dashboardURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://" + addr + "/"
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/"
 }
 
 func orDefault(v, def string) string {
