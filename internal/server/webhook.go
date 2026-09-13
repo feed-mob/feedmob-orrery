@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
+	"sort"
 	"strings"
 
 	"github.com/feed-mob/feedmob-orrery/internal/forge"
@@ -156,6 +158,18 @@ func (s *Server) dispatchEvent(ctx context.Context, event string, body []byte) (
 		return nil, fmt.Errorf("read workflows at %s: %w", sha, err)
 	}
 
+	// A push to the default branch is the moment a schedule change takes
+	// effect, because the default branch is the only place GitHub honours
+	// `on: schedule` from — and so the only place where reviewing a cron
+	// change means anything.
+	if event == "push" && p.Repository.DefaultBranch != "" &&
+		ev.Ref == "refs/heads/"+p.Repository.DefaultBranch {
+		if err := s.refreshSchedules(ctx, p.Repository.FullName, p.Repository.DefaultBranch, files); err != nil {
+			// The push still produces its runs; only the crons are stale.
+			s.log.Error("refreshing schedules failed", "repo", p.Repository.FullName, "err", err)
+		}
+	}
+
 	var ids []int64
 	for _, f := range files {
 		wf, err := workflow.Parse(f.Content)
@@ -241,4 +255,122 @@ func (s *Server) queueRun(ctx context.Context, wf *workflow.Workflow, f forge.Fi
 	run.ID = id
 	s.reportStatus(&run, forge.StatePending, fmt.Sprintf("%d job(s) queued", len(jobs)))
 	return id, nil
+}
+
+// ------------------------------------------------------------- dispatch --
+
+// DispatchRequest is a manual run: the `workflow_dispatch` button, as an API.
+type DispatchRequest struct {
+	Repo         string            `json:"repo"`
+	WorkflowFile string            `json:"workflow_file"`
+	Ref          string            `json:"ref"`
+	Actor        string            `json:"actor"`
+	Inputs       map[string]string `json:"inputs"`
+}
+
+// handleDispatch starts a run of one workflow, read from the forge at a ref.
+//
+// This is how a deploy or a rollback gets triggered by a person rather than by
+// a commit, and it is the only trigger where the inputs come from outside the
+// repository — which is why they are checked against what the workflow
+// declared before anything starts.
+func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
+	req, err := decode[DispatchRequest](r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Repo == "" || req.WorkflowFile == "" {
+		writeErr(w, http.StatusBadRequest, "repo and workflow_file are required")
+		return
+	}
+	ref := req.Ref
+	if ref == "" {
+		ref = "HEAD"
+	}
+	ctx := r.Context()
+
+	files, err := s.forge.Workflows(ctx, req.Repo, ref)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	var file *forge.File
+	for i := range files {
+		if files[i].Path == req.WorkflowFile || path.Base(files[i].Path) == req.WorkflowFile {
+			file = &files[i]
+			break
+		}
+	}
+	if file == nil {
+		writeErr(w, http.StatusNotFound, fmt.Sprintf("no workflow %q in %s at %s", req.WorkflowFile, req.Repo, ref))
+		return
+	}
+
+	wf, err := workflow.Parse(file.Content)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	declared, ok, err := wf.DispatchInputs()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("%s does not declare `on: workflow_dispatch`", file.Path))
+		return
+	}
+	inputs, err := workflow.ValidateDispatch(declared, req.Inputs)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	jobs, err := newJobsFor(wf, file.Content)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// GitHub puts the values under github.event.inputs, and workflows read them
+	// there; `inputs.*` is the newer spelling of the same thing.
+	payload, err := json.Marshal(map[string]any{
+		"inputs":   inputs,
+		"ref":      ref,
+		"workflow": file.Path,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	run := store.Run{
+		Repo: req.Repo, WorkflowName: wf.Name, WorkflowFile: file.Path,
+		Event: "workflow_dispatch", Ref: ref, Actor: orDefault(req.Actor, "api"),
+		EventPayload: string(payload),
+	}
+	if err := s.applyConcurrency(wf, &run); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	runID, err := s.st.CreateRun(ctx, run, jobs)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.wake.broadcast()
+	s.log.Info("workflow dispatched", "run", runID, "repo", req.Repo,
+		"workflow", file.Path, "ref", ref, "inputs", keysOfAny(inputs))
+	writeJSON(w, http.StatusOK, SubmitResponse{RunID: runID, Jobs: wf.JobOrder})
+}
+
+// keysOfAny logs which inputs were supplied without logging their values: a
+// dispatch input is a plausible place for someone to paste a token.
+func keysOfAny(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

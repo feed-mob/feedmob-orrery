@@ -120,6 +120,12 @@ printf 'GITHUB_TOKEN=%s\n' "$(gh auth token)" > secrets.env && chmod 600 secrets
 ./bin/orrery stop <job-id>                    # 请求停止；runner 收尾后确认
 ```
 
+```bash
+# 手动触发一次部署：参数在 run 创建之前就校验，错了不会有 job 起来
+./bin/orrery dispatch feed-mob/app deploy.yml --ref main \
+  --input environment=production --input version=v1.2.3 --wait
+```
+
 `submit` 默认从 workflow 所在的 git 检出读取 `repo` / `ref` / `sha`——这三个值直接变成
 `github` 上下文，`actions/checkout` 按字面使用它们。`-forge-url` 指向代码所在的
 forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`uses:` 从哪解析）
@@ -142,6 +148,8 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | 步骤时间线（名称 / 结果 / 耗时 / 日志区间） | ✅ 落库并在 CLI 展示 |
 | 密钥注入与作用域 | ✅ 派发时注入，不落库；日志只打印密钥名 |
 | **git 事件触发**（#1 #36 #38） | ✅ 签名校验的 GitHub webhook；按 delivery id 幂等；`branches` / `tags` / `paths` / `types` 过滤 |
+| **定时触发**（#2） | ✅ `on: schedule`，从默认分支注册；重叠由并发组接管——GitHub 根本没有重叠策略 |
+| **带参手动触发**（#3） | ✅ `workflow_dispatch` inputs：required / default / choice / boolean / number 全部在 run 创建前校验 |
 | **`github.event`** | ✅ 事件原文入库并注入，`${{ github.event.pull_request.number }}` 可用 |
 | **跨 job 传值**（#40） | ✅ `needs.<job>.outputs.*` 与 `needs.<job>.result` |
 | **状态回写**（#47） | ✅ Commit Status API，`orrery / <workflow>`；入队 pending、落定终态 |
@@ -166,6 +174,11 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
   读 `.github/workflows/` → 每个 `on:` 匹配的 workflow 起一个 run。
   `pull_request` 读的是 PR head 的 workflow，所以 PR 可以改自己的 CI；
   `pull_request_target` **不接受**（那是 pwn-request 向量，见 feature-inventory #39）。
+- **定时**：push 到默认分支时，把该仓库 workflow 里的 `on: schedule` cron 注册下来
+  （只认默认分支——feature 分支上加的 cron 在合并前不该开始跑，否则"审一次 cron 变更"
+  就没有意义）。cron 语法是 GitHub 的五字段方言。**重叠不需要单独的策略**：定时 run
+  和别的 run 一样走并发组，上一次还没跑完，下一次就排队——这是 GitHub 的 schedule
+  完全没有的东西。
 - **回写**：run 入队即写 `pending`，落定写 `success` / `failure` / `error`，
   context 是 `orrery / <workflow 名>`——这就是分支保护里要勾的那个名字。
 - 没有 `-webhook-secret` 时 webhook 端点直接 503。**未签名的 webhook 端点等于

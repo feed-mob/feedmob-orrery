@@ -92,6 +92,7 @@ func main() {
 	defer stop()
 
 	go srv.RunReaper(ctx)
+	go srv.RunScheduler(ctx)
 
 	hs := &http.Server{
 		Addr:              *addr,

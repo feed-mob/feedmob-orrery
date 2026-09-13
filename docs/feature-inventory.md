@@ -37,7 +37,12 @@ P0 的骨架与执行器都已跑通，以下条目**已验证可用**，不再�
 
 | 17 | 并发组 | `concurrency` / `cancel-in-progress`，且**平台默认开启**（GitHub 有但默认关，正是 #17 要改的那条） |
 
-**下一项**是 `on: schedule` 定时触发（#2）与 `workflow_dispatch` 带参手动触发（#3）。
+| 2 | 定时触发 | `on: schedule`，从默认分支注册；重叠由并发组接管 |
+| 3 | 带参手动触发 | `workflow_dispatch` inputs，run 创建前校验；`orrery dispatch` |
+| 4 53 | API 触发与管理 API | `POST /api/dispatch`、`/api/runs`、`/api/webhooks/github` |
+
+**P0 的触发—执行—回写闭环到此完整。** 剩下的 P0 级缺口只有 `permissions:` 收窄 token（#45），
+它需要先有 GitHub App 才能铸造收窄的凭据，是部署决策而不是代码缺口。
 
 **已知边界**（见 README）：`GITHUB_API_URL` 对 github.com 是错的（`gitea/runner` v1.0.8 硬编码 Gitea 的 API 形状，无配置开关）；
 host 模式的 job 继承 runner 进程的环境变量；产物与缓存 action 必须钉 `@v3`，且属于产生它的那台 runner。

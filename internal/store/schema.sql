@@ -149,3 +149,21 @@ CREATE TABLE IF NOT EXISTS deliveries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_deliveries_received ON deliveries (received_at);
+
+-- `on: schedule` crons, read from each repository's default branch.
+--
+-- Stored rather than re-read from the forge every tick: a cron that lives only
+-- in a workflow file costs one API call per repository per minute, against a
+-- rate limit shared with everything else Orrery does.
+CREATE TABLE IF NOT EXISTS schedules (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo          TEXT NOT NULL,
+    workflow_file TEXT NOT NULL,
+    ref           TEXT NOT NULL,
+    cron          TEXT NOT NULL,
+    next_due_at   TEXT NOT NULL,
+    last_fired_at TEXT,
+    UNIQUE (repo, workflow_file, cron)
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules (next_due_at);

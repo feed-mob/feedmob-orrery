@@ -31,6 +31,10 @@ type Config struct {
 	// StopGrace is how long a runner has to acknowledge a stop before the
 	// reaper force-terminates it and records that cleanup never ran.
 	StopGrace time.Duration
+	// ScheduleInterval is how often due crons are looked for. A minute is the
+	// finest granularity GitHub's cron syntax can express, so checking more
+	// often only costs queries.
+	ScheduleInterval time.Duration
 	// ReaperInterval is how often timeouts and unacked stops are swept.
 	ReaperInterval time.Duration
 	// Secrets are injected into a task at dispatch time. They are deliberately
@@ -110,6 +114,9 @@ func (c *Config) withDefaults() {
 	if c.ReaperInterval <= 0 {
 		c.ReaperInterval = 5 * time.Second
 	}
+	if c.ScheduleInterval <= 0 {
+		c.ScheduleInterval = 30 * time.Second
+	}
 	c.Forge.withDefaults()
 }
 
@@ -145,6 +152,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"UpdateLog", s.authed(s.handleUpdateLog))
 
 	s.mux.HandleFunc("POST /api/webhooks/github", s.handleGitHubWebhook)
+	s.mux.HandleFunc("POST /api/dispatch", s.handleDispatch)
 	s.mux.HandleFunc("POST /api/runs", s.handleSubmitRun)
 	s.mux.HandleFunc("GET /api/runs", s.handleListRuns)
 	s.mux.HandleFunc("GET /api/runs/{id}", s.handleGetRun)

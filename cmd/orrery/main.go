@@ -18,6 +18,7 @@ const usage = `orrery — submit workflows to an Orrery server and read what hap
 
 usage:
   orrery submit <workflow.yml> [--repo R] [--event E] [--ref REF] [--wait]
+  orrery dispatch <repo> <workflow-file> [--ref REF] [--input k=v ...] [--wait]
   orrery runs [--limit N]
   orrery run <id>
   orrery logs <job-id>
@@ -38,6 +39,8 @@ func main() {
 	switch os.Args[1] {
 	case "submit":
 		err = submit(base, os.Args[2:])
+	case "dispatch":
+		err = dispatch(base, os.Args[2:])
 	case "runs":
 		err = listRuns(base, os.Args[2:])
 	case "run":
@@ -115,6 +118,44 @@ func submit(base string, args []string) error {
 		Jobs  []string `json:"jobs"`
 	}
 	if err := post(base+"/api/runs", body, &out); err != nil {
+		return err
+	}
+	fmt.Printf("run %d queued — %d job(s): %s\n", out.RunID, len(out.Jobs), strings.Join(out.Jobs, ", "))
+	if !hasFlag(args, "wait") {
+		return nil
+	}
+	return waitForRun(base, out.RunID)
+}
+
+// dispatch starts a manual run of a workflow already in the repository, the
+// way GitHub's "Run workflow" button does.
+func dispatch(base string, args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: orrery dispatch <repo> <workflow-file> [--ref REF] [--input k=v ...]")
+	}
+	inputs := map[string]string{}
+	for i := 0; i < len(args); i++ {
+		if args[i] != "--input" || i+1 >= len(args) {
+			continue
+		}
+		k, v, ok := strings.Cut(args[i+1], "=")
+		if !ok {
+			return fmt.Errorf("--input wants k=v, got %q", args[i+1])
+		}
+		inputs[k] = v
+	}
+	body := map[string]any{
+		"repo":          args[0],
+		"workflow_file": args[1],
+		"ref":           flagValue(args, "ref", ""),
+		"actor":         env("USER", "cli"),
+		"inputs":        inputs,
+	}
+	var out struct {
+		RunID int64    `json:"run_id"`
+		Jobs  []string `json:"jobs"`
+	}
+	if err := post(base+"/api/dispatch", body, &out); err != nil {
 		return err
 	}
 	fmt.Printf("run %d queued — %d job(s): %s\n", out.RunID, len(out.Jobs), strings.Join(out.Jobs, ", "))

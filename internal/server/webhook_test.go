@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -284,5 +286,242 @@ func waitForStatus(t *testing.T, f *fakeForge) map[string]any {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no commit status was written")
 		return nil
+	}
+}
+
+const dispatchWorkflow = `
+name: Manual Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: true
+        type: choice
+        options: [staging, production]
+      version:
+        default: latest
+jobs:
+  deploy:
+    runs-on: [self-hosted]
+    steps:
+      - run: echo ${{ github.event.inputs.environment }}
+`
+
+func postJSON(t *testing.T, url string, body any) (int, map[string]any) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	res, err := http.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer res.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	return res.StatusCode, out
+}
+
+func TestDispatchValidatesInputsBeforeAnythingStarts(t *testing.T) {
+	hs, st, _ := webhookServer(t, dispatchWorkflow)
+
+	code, body := postJSON(t, hs.URL+"/api/dispatch", DispatchRequest{
+		Repo: "feed-mob/app", WorkflowFile: "ci.yml", Ref: "main",
+		Inputs: map[string]string{"environment": "production"},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("status = %d (%v)", code, body)
+	}
+	runs, _ := st.ListRuns(t.Context(), 10)
+	if len(runs) != 1 || runs[0].Event != "workflow_dispatch" {
+		t.Fatalf("runs = %+v", runs)
+	}
+	// The values have to reach the workflow where it reads them.
+	meta, _ := st.RunMeta(t.Context(), runs[0].ID)
+	var payload struct {
+		Inputs map[string]any `json:"inputs"`
+	}
+	if err := json.Unmarshal([]byte(meta.EventPayload), &payload); err != nil {
+		t.Fatalf("event payload: %v", err)
+	}
+	if payload.Inputs["environment"] != "production" || payload.Inputs["version"] != "latest" {
+		t.Errorf("inputs = %+v, want the supplied value and the default", payload.Inputs)
+	}
+
+	// A bad value must be refused before a run exists, not after a job started.
+	code, _ = postJSON(t, hs.URL+"/api/dispatch", DispatchRequest{
+		Repo: "feed-mob/app", WorkflowFile: "ci.yml", Ref: "main",
+		Inputs: map[string]string{"environment": "prod"},
+	})
+	if code != http.StatusBadRequest {
+		t.Errorf("a value outside the declared choices got %d, want 400", code)
+	}
+	if runs, _ := st.ListRuns(t.Context(), 10); len(runs) != 1 {
+		t.Errorf("a refused dispatch created a run")
+	}
+}
+
+// A workflow that does not offer the button must not be startable by pressing it.
+func TestDispatchRefusesAWorkflowThatDoesNotDeclareIt(t *testing.T) {
+	hs, st, _ := webhookServer(t, ciWorkflow)
+	code, body := postJSON(t, hs.URL+"/api/dispatch", DispatchRequest{
+		Repo: "feed-mob/app", WorkflowFile: "ci.yml", Ref: "main",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d (%v), want 400", code, body)
+	}
+	if runs, _ := st.ListRuns(t.Context(), 10); len(runs) != 0 {
+		t.Error("a run was created for a workflow with no workflow_dispatch")
+	}
+}
+
+const scheduledWorkflow = `
+name: Nightly
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * *'
+    - cron: '*/30 * * * *'
+jobs:
+  sweep:
+    runs-on: [self-hosted]
+    steps:
+      - run: echo sweep
+`
+
+// A cron added on a feature branch must not fire before it is merged, which is
+// the only rule under which reviewing a schedule change means anything.
+func TestSchedulesComeFromTheDefaultBranchOnly(t *testing.T) {
+	hs, st, _ := webhookServer(t, scheduledWorkflow)
+
+	push := pushPayload("refs/heads/feature", "abc123", "main.go")
+	if code, _ := deliver(t, hs.URL, "push", "d1", push, true); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	if due, _ := st.DueSchedules(t.Context(), time.Now().Add(24*time.Hour)); len(due) != 0 {
+		t.Fatalf("a push to a feature branch registered %d schedules", len(due))
+	}
+
+	push = pushPayload("refs/heads/main", "abc123", "main.go")
+	if code, _ := deliver(t, hs.URL, "push", "d2", push, true); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	due, err := st.DueSchedules(t.Context(), time.Now().Add(48*time.Hour))
+	if err != nil {
+		t.Fatalf("due: %v", err)
+	}
+	if len(due) != 2 {
+		t.Fatalf("got %d schedules, want the workflow's two crons: %+v", len(due), due)
+	}
+	for _, sc := range due {
+		if sc.Repo != "feed-mob/app" || sc.WorkflowFile != ".github/workflows/ci.yml" || sc.Ref != "main" {
+			t.Errorf("schedule = %+v", sc)
+		}
+		if sc.NextDueAt.Before(time.Now()) {
+			t.Errorf("schedule %q is due in the past: %v", sc.Cron, sc.NextDueAt)
+		}
+	}
+}
+
+// A cron deleted from the default branch has to stop firing, and its absence is
+// the only signal we get.
+func TestSchedulesAreReplacedNotMerged(t *testing.T) {
+	forgeWF := scheduledWorkflow
+	f := &fakeForge{workflow: forgeWF, statuses: make(chan map[string]any, 8)}
+	gh := httptest.NewServer(f.handler())
+	defer gh.Close()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "sched.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	srv := New(st, Config{
+		RegistrationToken: regToken, WebhookSecret: hookSecret,
+		Forge: Forge{URL: "https://github.com", APIURL: gh.URL}, ForgeToken: "t",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+
+	push := pushPayload("refs/heads/main", "abc123", "main.go")
+	if code, _ := deliver(t, hs.URL, "push", "d1", push, true); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	if due, _ := st.DueSchedules(t.Context(), time.Now().Add(48*time.Hour)); len(due) != 2 {
+		t.Fatalf("want 2 schedules first, got %d", len(due))
+	}
+
+	// The workflow loses one cron and is pushed again.
+	f.workflow = strings.Replace(scheduledWorkflow, "    - cron: '*/30 * * * *'\n", "", 1)
+	if code, _ := deliver(t, hs.URL, "push", "d2", push, true); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	due, _ := st.DueSchedules(t.Context(), time.Now().Add(48*time.Hour))
+	if len(due) != 1 || due[0].Cron != "17 3 * * *" {
+		t.Fatalf("after removing a cron: %+v", due)
+	}
+}
+
+// An unparseable cron must not take the rest of the file down with it.
+func TestABadCronIsSkippedNotFatal(t *testing.T) {
+	wf := strings.Replace(scheduledWorkflow, "'*/30 * * * *'", "'not a cron'", 1)
+	hs, st, _ := webhookServer(t, wf)
+	push := pushPayload("refs/heads/main", "abc123", "main.go")
+	if code, _ := deliver(t, hs.URL, "push", "d1", push, true); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	due, _ := st.DueSchedules(t.Context(), time.Now().Add(48*time.Hour))
+	if len(due) != 1 || due[0].Cron != "17 3 * * *" {
+		t.Fatalf("a bad cron took the good one with it: %+v", due)
+	}
+}
+
+// A schedule that fires and then fails to be rescheduled would fire again on
+// the next tick; a cron that runs every few seconds because its workflow is
+// broken is worse than one that misses an occurrence.
+func TestSchedulerAdvancesBeforeItStarts(t *testing.T) {
+	f := &fakeForge{workflow: scheduledWorkflow, statuses: make(chan map[string]any, 8)}
+	gh := httptest.NewServer(f.handler())
+	defer gh.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "tick.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	srv := New(st, Config{
+		RegistrationToken: regToken, ScheduleInterval: 10 * time.Millisecond,
+		Forge: Forge{URL: "https://github.com", APIURL: gh.URL}, ForgeToken: "t",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	past := time.Now().UTC().Add(-time.Hour)
+	if err := st.ReplaceSchedules(t.Context(), "feed-mob/app", []store.Schedule{
+		{Repo: "feed-mob/app", WorkflowFile: ".github/workflows/ci.yml", Ref: "main",
+			Cron: "17 3 * * *", NextDueAt: past},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go srv.RunScheduler(ctx)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if runs, _ := st.ListRuns(t.Context(), 10); len(runs) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Let several more ticks go by; a schedule that did not advance fires again.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	runs, _ := st.ListRuns(t.Context(), 10)
+	if len(runs) != 1 {
+		t.Fatalf("got %d runs from one due schedule, want exactly 1", len(runs))
+	}
+	if runs[0].Event != "schedule" || runs[0].Actor != "orrery" {
+		t.Errorf("run = %+v", runs[0])
+	}
+	due, _ := st.DueSchedules(t.Context(), time.Now().UTC())
+	if len(due) != 0 {
+		t.Errorf("the schedule is still due after firing: %+v", due)
 	}
 }
