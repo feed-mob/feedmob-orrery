@@ -189,8 +189,11 @@ func (r *Runner) execute(ctx context.Context, task *protocol.Task) error {
 	if timeout <= 0 {
 		timeout = time.Hour
 	}
+	// Held separately from the stop context so the two reasons a job ends early
+	// stay distinguishable: someone asked, or its own clock ran out.
 	stopCtx, cancelTimeout := context.WithTimeout(stopCtx, timeout)
 	defer cancelTimeout()
+	timeoutCtx := stopCtx
 
 	var (
 		mu      sync.Mutex
@@ -257,10 +260,23 @@ func (r *Runner) execute(ctx context.Context, task *protocol.Task) error {
 		switch {
 		case wasStopped && errors.Is(execErr, context.Canceled):
 			logs.write("::orrery:: execution ended on the stop request")
+		case errors.Is(timeoutCtx.Err(), context.DeadlineExceeded):
+			// Already reported above, in the timeout's own words.
 		default:
 			logs.write(fmt.Sprintf("::error::%v", execErr))
 			r.log.Error("job execution returned an error", "task", task.ID, "err", execErr)
 		}
+	}
+	// A job killed by its own timeout is cancelled, not failed. Reporting it as
+	// a failure tells whoever reads the ledger that the code is broken, when
+	// what happened is that we stopped waiting — the same distinction the
+	// commit status draws.
+	timedOut := !wasStopped && errors.Is(timeoutCtx.Err(), context.DeadlineExceeded)
+	if timedOut {
+		logs.write(fmt.Sprintf("::orrery:: 超过 timeout-minutes: %d，已停止", task.TimeoutMinutes))
+		r.log.Warn("task hit its own timeout", "task", task.ID, "timeout_min", task.TimeoutMinutes)
+		final = protocol.ResultCancelled
+		steps = markCancelled(steps, time.Now().UTC())
 	}
 	if wasStopped {
 		final = protocol.ResultCancelled

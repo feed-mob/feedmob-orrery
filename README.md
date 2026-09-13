@@ -144,7 +144,8 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | runner.v1 协议（`Register` / `Declare` / `FetchTask` / `UpdateTask` / `UpdateLog`） | ✅ Connect 风格 JSON over HTTP |
 | 调度：`needs` DAG、标签匹配、原子抢占 | ✅ 上游落定后由 `if:` 决定跑还是标 `skipped`，不会永久阻塞 |
 | 日志流：增量提交 + 服务端 ack 定义投递 | ✅ 重复窗口幂等，跳跃窗口被拒 |
-| **带确认的停止**：请求 → 确认 → 超时强杀 | ✅ 台账区分 `cleanup_ran=true/false`；被打断的步骤记 `cancelled` 而非 `failure` |
+| **带确认的停止**：请求 → 确认 → 超时强杀 | ✅ 容器 job 实测 1.2 秒确认；host job 可能停不下来要强杀，台账如实记，见下 |
+| 超时 | ✅ 两层：runner 自己的 deadline，和服务端回收器；都落定为 `cancelled` 而非 `failure` |
 | 平台级默认超时 | ✅ 作者可下调，不可遗漏 |
 | **并发组**（#17） | ✅ `concurrency` / `cancel-in-progress`；**平台默认开启**，见下 |
 | **`uses:` action** | ✅ `actions/checkout@v4` + `actions/setup-node@v4` 已端到端跑通 |
@@ -333,12 +334,31 @@ Gitea 的 API 形状（`<forge>/api/v1`，且把 `GITHUB_GRAPHQL_URL` 置空）�
 修它意味着把 act 那棵树接管过来自己维护，而不是继续跟上游——这是产品决策，不是补丁，
 见 charter 的 (a)/(b) 分工。
 
-**容器里的步骤偶发会卡住不返回。** 在本机（Colima）跑产物用例时见过一次：
+**容器里的步骤偶发会卡住不返回。** 在本机（Colima）跑产物用例时见过两次：
 `actions/cache` 的 post 步骤已经打印完 "Cache saved successfully"，但 act 的
-`waitForCommand` 还在等 docker exec 的输出流关闭，流一直没关。栈在 act 的容器层，
-不在我们的代码里。**兜底是超时**——那个 job 写了 `timeout-minutes: 10`，回收器到点
-会请求停止、宽限期后强杀，并在台账里把 `cleanup_ran` 记成 0。这正是"超时 NOT NULL
-且有平台默认值"这条设计要防的情况：忘记写超时的 job 遇到这种卡死会永远占着 runner。
+`waitForCommand` 还在等 docker exec 的输出流关闭，流一直没关。栈在 act 的容器层（`waitForCommand`
+还在等 docker exec 的输出流关闭），不在我们的代码里——两次 goroutine dump 里都没有
+Orrery 自己的 goroutine。
+
+**兜底是两层独立的超时，都实测过**：
+
+1. runner 自己的。job 的 `timeout-minutes` 就是执行上下文的 deadline，到点 act 的
+   exec 等待被取消，job 落定为 **cancelled**（不是 failure——超时是我们不等了，
+   不是代码坏了），日志里写明超的是哪个值。实测 1 分钟超时的 job 在第 60 秒收场。
+2. 服务端回收器的。runner 整个进程没了的时候第一层也没了，这时到点由服务端请求停止、
+   宽限期内没人确认就强杀，`cleanup_ran` 记成 0。实测过一个被 kill 掉的孤儿 job。
+
+这正是"超时 NOT NULL 且有平台默认值"要防的情况：忘记写超时的 job 遇到这种卡死会
+一直占着 runner，还一直占着并发组。
+
+**host 模式的 job 不一定停得下来。** 容器 job 的协作式停止是干净的——实测请求到确认
+1.2 秒，`force_terminated=0`、`cleanup_ran=1`。host 模式不一定：act 用
+`exec.CommandContext` 只杀直接子进程，而步骤跑的是 `bash`，`bash` 再起的进程会变成
+孤儿并继续持有 stdout 管道，于是 `cmd.Wait()` 卡住，runner 在宽限期内确认不了。
+实测一个 `sleep 300` 的 host job 最后是被强杀的，台账如实记下
+`force_terminated=1`、`cleanup_ran=0`——三列状态这个设计正是为了这种时候不撒谎。
+
+**需要能被可靠停止的 job，用容器跑。**
 
 **host 模式的 job 会继承 runner 进程的整个环境变量。** 这是 act host 模式的行为，
 GitHub 的 self-hosted runner 同样如此。默认标签里 `self-hosted:host` 是开着的，
