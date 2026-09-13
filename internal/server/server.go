@@ -44,6 +44,13 @@ type Config struct {
 	Secrets map[string]string
 	// Vars are non-secret configuration, same injection path.
 	Vars map[string]string
+	// EnvSecrets are per-environment overlays, keyed by environment name.
+	//
+	// A staging deploy and a production deploy are the same workflow file with
+	// a different `environment:`, and giving them the same credentials means
+	// the staging run can reach production. These are merged over Secrets for
+	// a job that declares that environment, and only for that job.
+	EnvSecrets map[string]map[string]string
 	// Forge is where the code being built lives. It becomes github.server_url /
 	// api_url / graphql_url, which actions read literally — actions/checkout
 	// builds its clone URL from it. This is a different question from where
@@ -412,7 +419,7 @@ func (s *Server) tryClaim(ctx context.Context, runner *store.Runner) (*protocol.
 			"actor":      run.Actor,
 			"event_name": run.Event,
 			"workflow":   run.WorkflowName,
-			"token":      s.forgeToken(),
+			"token":      s.forgeToken(job.Environment),
 
 			// Every job of a run shares these. Using the job's own id instead
 			// is what makes an artifact uploaded by one job invisible to the
@@ -430,16 +437,36 @@ func (s *Server) tryClaim(ctx context.Context, runner *store.Runner) (*protocol.
 			// never modelled.
 			"event": decodeEvent(run.EventPayload),
 		},
-		Secrets: s.cfg.Secrets,
+		Secrets: s.secretsFor(job.Environment),
 		Vars:    s.cfg.Vars,
 	}, version, nil
+}
+
+// secretsFor overlays an environment's own secrets on the global set.
+//
+// Scoped to the job, not the run: a workflow with a staging job and a
+// production job hands each one only what its environment is entitled to, and
+// the staging job cannot reach production even though they share a file.
+func (s *Server) secretsFor(env string) map[string]string {
+	overlay := s.cfg.EnvSecrets[env]
+	if len(overlay) == 0 {
+		return s.cfg.Secrets
+	}
+	out := make(map[string]string, len(s.cfg.Secrets)+len(overlay))
+	for k, v := range s.cfg.Secrets {
+		out[k] = v
+	}
+	for k, v := range overlay {
+		out[k] = v
+	}
+	return out
 }
 
 // forgeToken is what a task gets as `github.token`. An explicitly configured
 // GITHUB_TOKEN secret wins, so an operator can hand jobs a narrower credential
 // than the one this server uses to read workflows and write statuses.
-func (s *Server) forgeToken() string {
-	if v := s.cfg.Secrets["GITHUB_TOKEN"]; v != "" {
+func (s *Server) forgeToken(env string) string {
+	if v := s.secretsFor(env)["GITHUB_TOKEN"]; v != "" {
 		return v
 	}
 	return s.cfg.ForgeToken

@@ -169,6 +169,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **用量统计**（#51） | ✅ 按仓库 × workflow 的机器时间、run 数、失败数；毫秒精度 |
 | **限流**（#68） | ✅ 每仓库每窗口的投递上限，默认 60/分钟 |
 | **action 白名单**（#46） | ✅ `-allowed-actions`、`-require-action-sha`；入队前就拒 |
+| **环境级密钥**（#55） | ✅ `-secrets-dir`，按 job 的 `environment:` 覆盖；staging 够不到 production |
 | **部署台账与回滚**（#58 #59 #60） | ✅ `environment:` 记账；一键回滚（跳过当前版本、连按会一直往回走）；`auto-rollback` |
 | **`workflow_run` 链式触发**（#37） | ✅ 一个 workflow 落定后触发另一个；只跳一跳，不会成环 |
 | **自动重试**（#66） | ✅ job 级 `retry:`，指数退避；GitHub 完全没有这个 |
@@ -356,6 +357,23 @@ GitHub App，再升级到 Checks API 拿 diff 行内注解。
 美元的数字，比没有数字更糟。要算钱，在外面乘。
 
 精度到毫秒：整秒会把快 job 舍成 0，而一页给 5 个 run 报"0 分"之后就没人会再信它。
+
+### 环境级密钥
+
+```
+-secrets-dir /etc/orrery/environments    # production.env / staging.env / …
+```
+
+staging 的部署和 production 的部署是同一份 workflow 文件加一个不同的 `environment:`。
+给它们同一套凭据，等于 staging 的 run 可以够到 production。这些文件按环境**覆盖**在
+全局 `-secrets` 之上，而且**按 job 作用域**——一份 workflow 里的 staging job 和
+production job 各自只拿到自己那份。
+
+一个环境一个文件而不是一个文件加前缀：文件才能有各自的属主和权限，这是"staging 的凭据
+不是 production 的"在真机上唯一能站住的形式。
+
+实测：production job 拿到 production 的 key，staging job 拿到 staging 的，
+staging 够不到 production，没声明 environment 的 job 两个都拿不到。
 
 ### 部署台账与回滚
 

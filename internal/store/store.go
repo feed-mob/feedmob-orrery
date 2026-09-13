@@ -419,6 +419,10 @@ type Job struct {
 	CleanupRan      bool
 	// Attempt is which re-run of this job the current state belongs to.
 	Attempt int64
+	// Environment is `environment:` on the job; empty means it is not a
+	// deployment. Carried on the dispatch path so the server can hand the job
+	// only the secrets that environment is entitled to.
+	Environment string
 	// Steps is filled by the readers that return a whole run; the dispatch path
 	// leaves it nil, because a runner claiming work has no use for it.
 	Steps []StepReport
@@ -538,7 +542,8 @@ func (s *Store) ClaimJob(ctx context.Context, r *Runner) (*Job, error) {
 	// The join is the concurrency gate: a run waiting for its group has queued
 	// jobs like any other, and they must not be handed out.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT j.id, j.run_id, j.job_key, j.name, j.needs, j.runs_on, j.payload, j.timeout_minutes
+		SELECT j.id, j.run_id, j.job_key, j.name, j.needs, j.runs_on, j.payload, j.timeout_minutes,
+		       j.environment
 		FROM jobs j JOIN runs r ON r.id = j.run_id
 		WHERE j.status = 'queued' AND r.status != 'pending'
 		      AND (j.retry_after IS NULL OR j.retry_after <= ?)
@@ -554,7 +559,8 @@ func (s *Store) ClaimJob(ctx context.Context, r *Runner) (*Job, error) {
 	for rows.Next() {
 		var j Job
 		var needs, runsOn string
-		if err := rows.Scan(&j.ID, &j.RunID, &j.Key, &j.Name, &needs, &runsOn, &j.Payload, &j.TimeoutMinutes); err != nil {
+		if err := rows.Scan(&j.ID, &j.RunID, &j.Key, &j.Name, &needs, &runsOn, &j.Payload,
+			&j.TimeoutMinutes, &j.Environment); err != nil {
 			rows.Close()
 			return nil, err
 		}

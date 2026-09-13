@@ -178,3 +178,43 @@ func TestRepoAllowlist(t *testing.T) {
 		t.Error("an unlisted repo was accepted; a leaked webhook secret would run its workflows")
 	}
 }
+
+// A staging deploy and a production deploy are the same workflow file with a
+// different `environment:`. Giving them the same credentials means the staging
+// run can reach production.
+func TestSecretsAreScopedToTheEnvironment(t *testing.T) {
+	s := &Server{cfg: Config{
+		Secrets: map[string]string{"GITHUB_TOKEN": "shared", "SHARED": "yes"},
+		EnvSecrets: map[string]map[string]string{
+			"production": {"DEPLOY_KEY": "prod-key", "GITHUB_TOKEN": "prod-token"},
+			"staging":    {"DEPLOY_KEY": "staging-key"},
+		},
+	}}
+
+	prod := s.secretsFor("production")
+	if prod["DEPLOY_KEY"] != "prod-key" {
+		t.Errorf("production DEPLOY_KEY = %q", prod["DEPLOY_KEY"])
+	}
+	if prod["SHARED"] != "yes" {
+		t.Errorf("the global set should still come through: %+v", prod)
+	}
+	// An environment may override a global secret, not merely add to it.
+	if prod["GITHUB_TOKEN"] != "prod-token" {
+		t.Errorf("production GITHUB_TOKEN = %q, want the environment's own", prod["GITHUB_TOKEN"])
+	}
+	if got := s.secretsFor("staging")["DEPLOY_KEY"]; got != "staging-key" {
+		t.Errorf("staging DEPLOY_KEY = %q; staging can reach production", got)
+	}
+	// A job with no environment gets only the global set, and the map it gets
+	// must not be one a previous overlay mutated.
+	plain := s.secretsFor("")
+	if _, leaked := plain["DEPLOY_KEY"]; leaked {
+		t.Errorf("an environment's secret leaked into an ordinary job: %+v", plain)
+	}
+	if got := s.forgeToken("production"); got != "prod-token" {
+		t.Errorf("github.token for production = %q", got)
+	}
+	if got := s.forgeToken(""); got != "shared" {
+		t.Errorf("github.token with no environment = %q", got)
+	}
+}

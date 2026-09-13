@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,12 +30,14 @@ func main() {
 		regToken    = flag.String("registration-token", os.Getenv("ORRERY_REGISTRATION_TOKEN"), "shared secret a runner presents once to register")
 		grace       = flag.Duration("stop-grace", 30*time.Second, "how long a runner has to acknowledge a stop before it is force-terminated")
 		secretsFile = flag.String("secrets", "", "optional KEY=VALUE file injected into every task; values are never persisted")
-		forgeURL    = flag.String("forge-url", "https://github.com", "where the code being built lives; becomes github.server_url, which actions/checkout clones from")
-		forgeAPI    = flag.String("forge-api-url", "", "forge REST API root; derived from -forge-url when empty (api.github.com for github.com, else <forge>/api/v3 — a Gitea forge must set /api/v1 here)")
-		forgeToken  = flag.String("forge-token", os.Getenv("ORRERY_FORGE_TOKEN"), "token used to read workflow files and write commit statuses; without it webhooks cannot read a private repo and results are not reported back")
-		hookSecret  = flag.String("webhook-secret", os.Getenv("ORRERY_WEBHOOK_SECRET"), "shared secret GitHub signs webhook deliveries with; empty disables the webhook endpoint")
-		publicURL   = flag.String("public-url", os.Getenv("ORRERY_PUBLIC_URL"), "where humans reach this server; used as the target of commit statuses")
-		apiToken    = flag.String("api-token", os.Getenv("ORRERY_API_TOKEN"),
+		secretsDir  = flag.String("secrets-dir", "",
+			"directory of <environment>.env files overlaid on -secrets for jobs declaring that `environment:`; a staging deploy should not hold production's credentials")
+		forgeURL   = flag.String("forge-url", "https://github.com", "where the code being built lives; becomes github.server_url, which actions/checkout clones from")
+		forgeAPI   = flag.String("forge-api-url", "", "forge REST API root; derived from -forge-url when empty (api.github.com for github.com, else <forge>/api/v3 — a Gitea forge must set /api/v1 here)")
+		forgeToken = flag.String("forge-token", os.Getenv("ORRERY_FORGE_TOKEN"), "token used to read workflow files and write commit statuses; without it webhooks cannot read a private repo and results are not reported back")
+		hookSecret = flag.String("webhook-secret", os.Getenv("ORRERY_WEBHOOK_SECRET"), "shared secret GitHub signs webhook deliveries with; empty disables the webhook endpoint")
+		publicURL  = flag.String("public-url", os.Getenv("ORRERY_PUBLIC_URL"), "where humans reach this server; used as the target of commit statuses")
+		apiToken   = flag.String("api-token", os.Getenv("ORRERY_API_TOKEN"),
 			"token every human-facing API call and the dashboard must present")
 		noAuth = flag.Bool("insecure-no-auth", false,
 			"serve the API and dashboard with no authentication; anyone who can reach the port can run arbitrary workflows with this server's secrets")
@@ -107,10 +110,16 @@ func main() {
 		log.Error("read secrets", "path", *secretsFile, "err", err)
 		os.Exit(1)
 	}
+	envSecrets, err := loadEnvSecrets(*secretsDir)
+	if err != nil {
+		log.Error("read per-environment secrets", "dir", *secretsDir, "err", err)
+		os.Exit(1)
+	}
 	srv := server.New(st, server.Config{
 		RegistrationToken:  *regToken,
 		StopGrace:          *grace,
 		Secrets:            secrets,
+		EnvSecrets:         envSecrets,
 		Vars:               vars,
 		Forge:              server.Forge{URL: *forgeURL, APIURL: *forgeAPI},
 		ForgeToken:         *forgeToken,
@@ -153,7 +162,7 @@ func main() {
 		"forge_token", *forgeToken != "", "webhooks", *hookSecret != "",
 		"default_concurrency", *defaultConc, "notify", *notifyHook != "",
 		"retention", *retention,
-		"auth", *apiToken != "",
+		"auth", *apiToken != "", "environments", keysOfEnv(envSecrets),
 		"secrets", keysOf(secrets))
 	log.Info("dashboard", "url", orDefault(*publicURL, dashboardURL(*addr)))
 	if *hookSecret == "" {
@@ -205,6 +214,31 @@ func loadSecrets(path string) (map[string]string, error) {
 	return out, nil
 }
 
+// readSecretFile reads a KEY=VALUE file without the ORRERY_SECRET_ overlay.
+//
+// Per-environment files are themselves an overlay; applying the process
+// environment to each of them would put the same value in every environment,
+// which is the opposite of what separate environments are for.
+func readSecretFile(path string) (map[string]string, error) {
+	out := map[string]string{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("malformed line %q: want KEY=VALUE", line)
+		}
+		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return out, nil
+}
+
 // dashboardURL turns a listen address into something clickable. ":8080" is a
 // valid address and "http://8080/" is not a URL.
 func dashboardURL(addr string) string {
@@ -248,6 +282,44 @@ func envWithPrefix(prefix string) map[string]string {
 }
 
 func keysOf(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// loadEnvSecrets reads <environment>.env from a directory.
+//
+// One file per environment rather than one file with prefixes: the files can
+// then have different owners and modes, which is the only way "staging's
+// credentials are not production's" survives contact with a real machine.
+func loadEnvSecrets(dir string) (map[string]map[string]string, error) {
+	if dir == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]map[string]string{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".env") {
+			continue
+		}
+		secrets, err := readSecretFile(filepath.Join(dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		out[strings.TrimSuffix(name, ".env")] = secrets
+	}
+	return out, nil
+}
+
+// keysOfEnv logs which environments have their own secrets, never the values.
+func keysOfEnv(m map[string]map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)

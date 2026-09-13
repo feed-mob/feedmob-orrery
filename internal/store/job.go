@@ -14,7 +14,7 @@ func (s *Store) JobByID(ctx context.Context, id int64) (*Job, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, run_id, job_key, name, needs, runs_on, payload, status, result, timeout_minutes,
 		       runner_id, started_at, stopped_at, stop_requested_at, stop_reason, stop_acked_at,
-		       force_terminated, cleanup_ran, attempt
+		       force_terminated, cleanup_ran, attempt, environment
 		FROM jobs WHERE id = ?`, id)
 	return scanJob(row)
 }
@@ -31,7 +31,7 @@ func scanJob(row rowScanner) (*Job, error) {
 	var force, cleanup int
 	err := row.Scan(&j.ID, &j.RunID, &j.Key, &j.Name, &needs, &runsOn, &j.Payload, &j.Status, &j.Result,
 		&j.TimeoutMinutes, &runnerID, &started, &stopped, &stopReq, &j.StopReason, &stopAck, &force, &cleanup,
-		&j.Attempt)
+		&j.Attempt, &j.Environment)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -636,7 +636,7 @@ func (s *Store) RunByID(ctx context.Context, id int64) (*RunSummary, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, run_id, job_key, name, needs, runs_on, payload, status, result, timeout_minutes,
 		       runner_id, started_at, stopped_at, stop_requested_at, stop_reason, stop_acked_at,
-		       force_terminated, cleanup_ran, attempt
+		       force_terminated, cleanup_ran, attempt, environment
 		FROM jobs WHERE run_id = ? ORDER BY id ASC`, id)
 	if err != nil {
 		return nil, err
