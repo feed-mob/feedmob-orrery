@@ -27,6 +27,7 @@ usage:
   orrery stop <job-id>
 
 env:
+  ORRERY_API_TOKEN   the server's -api-token; every command below needs it
   ORRERY_SERVER   server URL (default http://127.0.0.1:8080)
 `
 
@@ -396,11 +397,21 @@ func showLogs(base string, args []string) error {
 	if a := flagValue(args, "attempt", ""); a != "" {
 		url += "?attempt=" + a
 	}
-	res, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	if tok := apiToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
+	if res.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("unauthorized: set ORRERY_API_TOKEN")
+	}
 	_, err = io.Copy(os.Stdout, res.Body)
 	return err
 }
@@ -449,7 +460,15 @@ func get(url string, out any) error {
 	return do(req, out)
 }
 
+// apiToken is what the server's -api-token guards everything with. Read from
+// the environment rather than a flag so it does not end up in shell history or
+// in the process list next to a `ps`.
+func apiToken() string { return os.Getenv("ORRERY_API_TOKEN") }
+
 func do(req *http.Request, out any) error {
+	if tok := apiToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err

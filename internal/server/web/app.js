@@ -9,15 +9,51 @@ const tick = document.getElementById('tick');
 
 let timer = null;
 
+class Unauthorized extends Error {}
+
 async function api(path, opts) {
   const res = await fetch(path, opts);
   const text = await res.text();
+  if (res.status === 401) throw new Unauthorized('需要令牌');
   if (!res.ok) {
     let msg = text;
     try { msg = JSON.parse(text).error || text; } catch (_) {}
     throw new Error(msg || res.statusText);
   }
   return text ? JSON.parse(text) : null;
+}
+
+// The token is traded for an HttpOnly cookie rather than kept in localStorage:
+// anything in localStorage is readable by every script on the page, and this
+// token can start a workflow with the server's secrets.
+function renderSignIn(message) {
+  const input = el('input', {
+    type: 'password', placeholder: 'API token', autofocus: 'autofocus',
+    style: 'font:inherit;padding:7px 10px;border-radius:6px;border:1px solid var(--line);' +
+           'background:var(--bg);color:var(--ink);min-width:280px',
+  });
+  const submit = async () => {
+    try {
+      await api('/api/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: input.value }),
+      });
+      route();
+    } catch (err) {
+      renderSignIn(err instanceof Unauthorized ? '令牌不对' : err.message);
+    }
+  };
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+  app.replaceChildren(el('div', { class: 'card' },
+    el('h2', {}, '需要登录'),
+    el('div', { style: 'padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap' },
+      input,
+      el('button', { onclick: submit }, '进入'),
+      message ? el('span', { class: 'err-banner', style: 'border:0;padding:0' }, message) : null),
+    el('div', { class: 'dim', style: 'padding:0 14px 14px' },
+      '服务端 -api-token 的值。这个令牌能启动 workflow 并用到服务端注入的密钥。')));
+  input.focus();
 }
 
 function el(tag, attrs, ...kids) {
@@ -202,6 +238,7 @@ function emptyReason(j) {
 async function loadLog(j, box) {
   try {
     const res = await fetch('/api/jobs/' + j.ID + '/logs');
+    if (res.status === 401) { renderSignIn(); return; }
     const text = await res.text();
     box.replaceChildren(...colourise(text));
     // Only pin to the bottom while the job is still producing output;
@@ -240,6 +277,7 @@ async function act(url, label, body) {
     });
     route();
   } catch (err) {
+    if (err instanceof Unauthorized) { renderSignIn(); return; }
     app.prepend(el('div', { class: 'card' },
       el('div', { class: 'err-banner' }, label + '失败：' + err.message)));
   }
@@ -260,6 +298,7 @@ async function route() {
       : live && live.Status !== 'done';
     if (moving) timer = setTimeout(route, 2000);
   } catch (err) {
+    if (err instanceof Unauthorized) { renderSignIn(); return; }
     app.replaceChildren(el('div', { class: 'card' },
       el('div', { class: 'err-banner' }, '加载失败：' + err.message)));
     timer = setTimeout(route, 5000);

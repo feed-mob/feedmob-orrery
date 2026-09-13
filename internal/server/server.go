@@ -62,6 +62,11 @@ type Config struct {
 	// PublicURL is where a human can reach this server, used as the target of
 	// commit statuses. Empty means the status links nowhere.
 	PublicURL string
+	// APIToken guards every endpoint a person drives. Empty means the operator
+	// explicitly asked for no authentication; the server refuses to start
+	// otherwise, because an open port here is arbitrary code execution with
+	// this server's secrets attached.
+	APIToken string
 	// NotifyWebhook receives a message when a workflow's verdict changes.
 	// Slack-shaped {"text": …}, which Mattermost and Discord also accept.
 	NotifyWebhook string
@@ -157,14 +162,21 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"UpdateTask", s.authed(s.handleUpdateTask))
 	s.mux.HandleFunc("POST "+p+"UpdateLog", s.authed(s.handleUpdateLog))
 
+	// The webhook authenticates by signature, not by token: GitHub has no way
+	// to present one.
 	s.mux.HandleFunc("POST /api/webhooks/github", s.handleGitHubWebhook)
-	s.mux.HandleFunc("POST /api/dispatch", s.handleDispatch)
-	s.mux.HandleFunc("POST /api/runs", s.handleSubmitRun)
-	s.mux.HandleFunc("GET /api/runs", s.handleListRuns)
-	s.mux.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
-	s.mux.HandleFunc("POST /api/runs/{id}/rerun", s.handleRerun)
-	s.mux.HandleFunc("GET /api/jobs/{id}/logs", s.handleJobLogs)
-	s.mux.HandleFunc("POST /api/jobs/{id}/stop", s.handleStopJob)
+	// Everything a person drives needs the operator token. Reads included:
+	// a job's log is where a step's output lives, masked but not guaranteed
+	// empty of anything sensitive.
+	s.mux.HandleFunc("POST /api/session", s.handleSession)
+	s.mux.HandleFunc("GET /api/whoami", s.handleWhoAmI)
+	s.mux.HandleFunc("POST /api/dispatch", s.operator(s.handleDispatch))
+	s.mux.HandleFunc("POST /api/runs", s.operator(s.handleSubmitRun))
+	s.mux.HandleFunc("GET /api/runs", s.operator(s.handleListRuns))
+	s.mux.HandleFunc("GET /api/runs/{id}", s.operator(s.handleGetRun))
+	s.mux.HandleFunc("POST /api/runs/{id}/rerun", s.operator(s.handleRerun))
+	s.mux.HandleFunc("GET /api/jobs/{id}/logs", s.operator(s.handleJobLogs))
+	s.mux.HandleFunc("POST /api/jobs/{id}/stop", s.operator(s.handleStopJob))
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))

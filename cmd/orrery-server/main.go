@@ -33,7 +33,11 @@ func main() {
 		forgeToken  = flag.String("forge-token", os.Getenv("ORRERY_FORGE_TOKEN"), "token used to read workflow files and write commit statuses; without it webhooks cannot read a private repo and results are not reported back")
 		hookSecret  = flag.String("webhook-secret", os.Getenv("ORRERY_WEBHOOK_SECRET"), "shared secret GitHub signs webhook deliveries with; empty disables the webhook endpoint")
 		publicURL   = flag.String("public-url", os.Getenv("ORRERY_PUBLIC_URL"), "where humans reach this server; used as the target of commit statuses")
-		notifyHook  = flag.String("notify-webhook", os.Getenv("ORRERY_NOTIFY_WEBHOOK"),
+		apiToken    = flag.String("api-token", os.Getenv("ORRERY_API_TOKEN"),
+			"token every human-facing API call and the dashboard must present")
+		noAuth = flag.Bool("insecure-no-auth", false,
+			"serve the API and dashboard with no authentication; anyone who can reach the port can run arbitrary workflows with this server's secrets")
+		notifyHook = flag.String("notify-webhook", os.Getenv("ORRERY_NOTIFY_WEBHOOK"),
 			"chat webhook that receives a message when a workflow's verdict changes (Slack-shaped {\"text\"}); only changes are sent, not every run")
 		defaultConc = flag.String("default-concurrency", "${{ github.workflow }}@${{ github.ref }}",
 			"concurrency group applied to a workflow that declares none; runs sharing a group queue rather than race. Empty restores GitHub's behaviour of no limit")
@@ -47,6 +51,19 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
+	if *apiToken == "" && !*noAuth {
+		// Refusing to start is the point. POST /api/runs takes a workflow file
+		// and runs it on a runner with whatever secrets this server injects,
+		// so an unauthenticated port is remote code execution — and that is
+		// not a thing anyone should be able to switch on by forgetting a flag.
+		log.Error("refusing to start without authentication: set -api-token (or ORRERY_API_TOKEN), " +
+			"or pass -insecure-no-auth if this really is a throwaway local instance")
+		os.Exit(2)
+	}
+	if *noAuth {
+		log.Warn("running with NO authentication: anyone who can reach this port can run arbitrary " +
+			"workflows with this server's secrets")
+	}
 	if *regToken == "" {
 		log.Error("a registration token is required; set -registration-token or ORRERY_REGISTRATION_TOKEN")
 		os.Exit(2)
@@ -89,6 +106,7 @@ func main() {
 		PublicURL:          *publicURL,
 		DefaultConcurrency: *defaultConc,
 		NotifyWebhook:      *notifyHook,
+		APIToken:           *apiToken,
 	}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -116,6 +134,7 @@ func main() {
 		"stop_grace", *grace, "forge", *forgeURL,
 		"forge_token", *forgeToken != "", "webhooks", *hookSecret != "",
 		"default_concurrency", *defaultConc, "notify", *notifyHook != "",
+		"auth", *apiToken != "",
 		"secrets", keysOf(secrets))
 	log.Info("dashboard", "url", orDefault(*publicURL, "http://"+strings.TrimPrefix(*addr, ":")+"/"))
 	if *hookSecret == "" {

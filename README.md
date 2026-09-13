@@ -103,12 +103,13 @@ Orrery 读得懂现有的 workflow 文件，但底下是我们自己的引擎。
 
 ```bash
 go build -o bin/ ./cmd/...
-export ORRERY_REGISTRATION_TOKEN=$(openssl rand -hex 16)
+export ORRERY_REGISTRATION_TOKEN=$(openssl rand -hex 16)   # runner 拿它换自己的令牌
+export ORRERY_API_TOKEN=$(openssl rand -hex 24)            # 人和 CLI 用它
 
 # 密钥只在派发时注入进程与容器，从不落库
 printf 'GITHUB_TOKEN=%s\n' "$(gh auth token)" > secrets.env && chmod 600 secrets.env
 
-./bin/orrery-server -db orrery.db -secrets secrets.env &     # 控制面
+./bin/orrery-server -db orrery.db -secrets secrets.env &     # 控制面（含 Web UI）
 ./bin/orrery-runner \
   -labels 'self-hosted:host,ubuntu-latest:docker://catthehacker/ubuntu:act-22.04' &
 
@@ -158,9 +159,35 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **产物与缓存**（#27 #28） | ✅ runner 内置产物与缓存服务端；跨 job 传产物已验证。**必须钉 v3**，见下 |
 | **job 级 `if:`** | ✅ `always()` / `failure()` / `cancelled()` 与任意表达式，用 act 自己的解释器求值 |
 | **通知**（#50） | ✅ 变化才发：失败发一条、连着失败不重复、恢复再发一条；Slack 形状的 webhook |
+| **API / UI 认证** | ✅ 无 token 拒绝启动；bearer / HttpOnly 会话 cookie；webhook 走签名、healthz 开放 |
 | **Web UI**（#32） | ✅ 编译进二进制，无 CDN；run 列表、步骤时间线、日志、重跑、停止；深色与手机适配 |
 | **重跑**（#53） | ✅ `rerun [--failed]`：run 保持不变、attempt +1；成功 job 的产物与 outputs 留着给被重跑的用 |
 | `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
+| RBAC：谁能触发 / 审批 / 看日志（#73） | ⛔ 共享令牌没有"谁"，需要先定身份方案 |
+
+### 认证
+
+**没有 `-api-token` 服务端不启动。** 这不是洁癖：`POST /api/runs` 收一份 workflow
+文件，然后在 runner 上用这台服务器注入的密钥把它跑起来——一个不认证的端口就是
+任意代码执行外加一个密钥读取器。真要临时在本机跑，显式加 `-insecure-no-auth`，
+它会在日志里大声说自己是裸奔的。
+
+三条认证路径互不相同，各管各的：
+
+| | 怎么认证 |
+|---|---|
+| runner RPC | runner 自己的令牌（注册令牌换来，哈希入库） |
+| `/api/webhooks/github` | HMAC 签名——GitHub 没法带 bearer |
+| 其余全部 API 与 Web UI | `-api-token`（`Authorization: Bearer` / `X-Orrery-Token` / 会话 cookie） |
+| `/healthz` | 不认证——负载均衡器也没法带令牌 |
+
+读也要令牌：job 的日志就是步骤输出的所在，打过码不等于里面一定没有敏感东西。
+
+Web UI 用令牌换一个 **HttpOnly 的会话 cookie**，而不是把令牌塞进 localStorage——
+localStorage 里的东西页面上任何脚本都读得到，而这个令牌能启动带密钥的 workflow。
+
+**这还不是身份系统。** 一个共享令牌没有"谁"的概念，也就没法做 RBAC（#73）。
+它关掉的是"任何能连到端口的人"，不是"团队里的谁能做什么"。
 
 ### 接到 GitHub 上
 
