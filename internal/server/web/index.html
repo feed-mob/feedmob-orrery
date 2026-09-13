@@ -89,6 +89,14 @@ nav a {
 nav a:hover { color: var(--ink); }
 nav a.on { color: var(--accent); border-bottom: 2px solid var(--accent); }
 
+details.filters { border-bottom: 1px solid var(--line); }
+details.filters > summary {
+  cursor: pointer; padding: 10px 14px; font-size: 12px; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--dim); user-select: none;
+}
+details.filters > summary:hover { color: var(--ink); }
+details.filters[open] > summary { border-bottom: 1px solid var(--line); }
+
 .row { display: flex; align-items: center; gap: 10px; }
 .row.wrap { flex-wrap: wrap; }
 .row.tight { margin-top: 6px; }

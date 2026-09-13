@@ -153,11 +153,19 @@ async function renderRuns() {
   ]);
   const runs = page.Runs || [];
 
-  const controls = el('div', { class: 'row pad wrap' },
-    ...FILTERS.map(([key, label]) => filterControl(key, label, f, facets)),
-    Object.keys(f).length
-      ? el('button', { onclick: () => setFilters({}) }, '清除')
-      : null);
+  // A disclosure rather than an always-open row: seven stacked controls on a
+  // phone push the runs themselves off the screen. Open on a wide viewport, and
+  // open regardless when a filter is already applied — a hidden filter that is
+  // silently narrowing the list is worse than a tall page.
+  const active = Object.keys(f).filter(k => k !== 'before' && f[k]);
+  const controls = el('details', {
+    class: 'filters',
+    open: (window.matchMedia('(min-width: 721px)').matches || active.length) ? 'open' : null,
+  },
+    el('summary', {}, '筛选', active.length ? el('span', { class: 'dim' }, `（${active.length} 项）`) : null),
+    el('div', { class: 'row pad wrap' },
+      ...FILTERS.map(([key, label]) => filterControl(key, label, f, facets)),
+      active.length ? el('button', { onclick: () => setFilters({}) }, '清除') : null));
 
   const body = runs.length
     ? table(
