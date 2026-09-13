@@ -159,7 +159,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **`github.event`** | ✅ 事件原文入库并注入，`${{ github.event.pull_request.number }}` 可用 |
 | **跨 job 传值**（#40） | ✅ `needs.<job>.outputs.*` 与 `needs.<job>.result` |
 | **状态回写**（#47） | ✅ Commit Status API，`orrery / <workflow>`；入队 pending、落定终态 |
-| **产物与缓存**（#27 #28） | ✅ runner 内置产物与缓存服务端；跨 job 传产物已验证。**必须钉 v3**，见下 |
+| **产物与缓存**（#27 #28） | ✅ 跨 job 传产物已验证；服务端 `-artifact-dir` 打开中心化产物存储（多 runner 必须），缓存仍按 runner。**必须钉 v3**，见下 |
 | **job 级 `if:`** | ✅ `always()` / `failure()` / `cancelled()` 与任意表达式，用 act 自己的解释器求值 |
 | **通知**（#50） | ✅ 变化才发：失败发一条、连着失败不重复、恢复再发一条；Slack 形状的 webhook |
 | **日志容量上限** | ✅ 每个 job 每次 attempt 默认 64MB；超了就丢并留一行说明，不会顶爆磁盘 |
@@ -501,9 +501,28 @@ action 会**失败**，而不是静默什么都不做）。
 `ACTIONS_RESULTS_URL`——设了会把"请钉 v3"这条清晰的约束变成一个跑到一半才失败的
 action。
 
-**产物与缓存属于产生它的那台 runner。** 只有一台 runner 时这没有区别；有多台时，
-下游 job 的 `download-artifact` 只有在恰好落到同一台 runner 上才找得到上游的上传。
-中心化的产物存储是修法，在 P1。
+**中心化产物存储（多 runner 必须开）。** 服务端加 `-artifact-dir <目录>` 就打开，
+runner 不用配——它启动时问服务端要不要用共享库，要用就不起自己那个。产物落在服务端
+的目录里，哪台 runner 跑的 job 都能拿到。
+
+```bash
+orrery-server -artifact-dir /var/lib/orrery/artifacts -artifact-addr :34567
+```
+
+共享库单独监听一个端口，不是主端口下的一条路径：act 是拿请求的 `Host` 头去拼它回给
+`upload-artifact` 的 URL 的（`act/artifacts/server.go:102`），没有前缀这个概念，挂在
+路径下会先答一次、再把客户端指到一个不存在的地址。容器要能路由到这个地址；服务端在
+NAT 后面或自己在容器里时，用 `-artifact-host` 明说。
+
+**act 的产物服务端一行认证都没有。** 放在 runner 的 loopback 上还能接受，放在每个 job
+容器都够得着的控制面上不行。所以它绑在 127.0.0.1，所有请求都过一层代理：代理先认证，
+再检查路径里的 run 号——协议的六条路由每一条都带 run 号，所以能做到"这台 runner 只
+能读写它当前正在跑的 run 的产物"。凭据是**按 runner** 一个而不是按 job 一个，因为
+act 只认进程环境变量里的 `ACTIONS_RUNTIME_TOKEN`（`act/runner/run_context.go:1147`），
+一台 runner 同时跑两个 job 时只有一个值可给。授权补的就是这个差。
+
+**缓存仍然属于产生它的那台 runner。** 没跟着一起做，理由是：缓存没命中只是构建变慢，
+产物找不到是构建坏掉——两件事不值得同样多的机器。
 
 ### 两个已知缺口（不是疏忽，是已知边界）
 

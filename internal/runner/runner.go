@@ -50,6 +50,14 @@ type Options struct {
 	// these exist for a runner whose jobs are known not to use them.
 	NoArtifacts bool
 	NoCache     bool
+
+	// ArtifactURL and ArtifactToken are filled in at startup from the control
+	// plane's answer, not from a flag. The operator configures the shared store
+	// once, on the server; a runner discovers it. That way a fleet cannot end
+	// up half on the shared store and half on its own disk because one unit
+	// file was missed.
+	ArtifactURL   string
+	ArtifactToken string
 }
 
 func (o *Options) withDefaults() {
@@ -147,6 +155,17 @@ func New(cl *Client, opts Options, log *slog.Logger) *Runner {
 
 // Run loops until ctx is cancelled.
 func (r *Runner) Run(ctx context.Context) error {
+	// Ask the control plane whether it keeps a shared artifact store before
+	// deciding to serve one. An error here is not fatal: artifacts still work,
+	// they are just local to this runner, which is the behaviour every version
+	// before this one had.
+	r.opts.ArtifactToken = newToken()
+	if url, err := r.cl.ArtifactSession(ctx, r.opts.ArtifactToken); err != nil {
+		r.log.Warn("could not reach the shared artifact store; serving artifacts locally", "err", err)
+	} else {
+		r.opts.ArtifactURL = url
+	}
+
 	svc, err := startServices(ctx, r.opts, r.log)
 	if err != nil {
 		return err

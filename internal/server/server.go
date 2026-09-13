@@ -159,6 +159,16 @@ type Server struct {
 	forge    *forge.Client
 	notifier *notify.Webhook
 	limiter  *throttle
+	// artifacts is the shared artifact store, or nil when each runner keeps
+	// its own. nil is correct for a single runner and wrong for two.
+	artifacts *ArtifactStore
+}
+
+// UseArtifactStore attaches a shared artifact store. Separate from New because
+// the store owns a listener, and a server built for a test should not.
+func (s *Server) UseArtifactStore(a *ArtifactStore) {
+	s.artifacts = a
+	a.holds = s.st.RunnerHoldsRun
 }
 
 // New builds a server.
@@ -183,6 +193,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"FetchTask", s.authed(s.handleFetchTask))
 	s.mux.HandleFunc("POST "+p+"UpdateTask", s.authed(s.handleUpdateTask))
 	s.mux.HandleFunc("POST "+p+"UpdateLog", s.authed(s.handleUpdateLog))
+
+	// The runner registers the credential its job containers will present to
+	// the artifact store. It travels over the runner's own authenticated
+	// channel, so the artifact credential is never sent unauthenticated.
+	s.mux.HandleFunc("POST /api/artifacts/session", s.authed(s.handleArtifactSession))
 
 	// The webhook authenticates by signature, not by token: GitHub has no way
 	// to present one.

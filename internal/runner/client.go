@@ -97,3 +97,42 @@ func (c *Client) UpdateTask(ctx context.Context, req *protocol.UpdateTaskRequest
 func (c *Client) UpdateLog(ctx context.Context, req *protocol.UpdateLogRequest) (*protocol.UpdateLogResponse, error) {
 	return call[protocol.UpdateLogRequest, protocol.UpdateLogResponse](ctx, c, "UpdateLog", req)
 }
+
+// ArtifactSession registers this runner's artifact credential with the control
+// plane and returns the URL job containers should upload to. An empty URL means
+// the server keeps no shared store and this runner should serve its own — which
+// is the single-runner deployment, and stays correct.
+func (c *Client) ArtifactSession(ctx context.Context, token string) (string, error) {
+	body, err := json.Marshal(map[string]string{"token": token})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.base+"/api/artifacts/session", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	res, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("artifact session: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusNotFound {
+		// An older control plane that does not know the endpoint. Falling back
+		// to runner-local artifacts is what it would have done anyway.
+		return "", nil
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		return "", fmt.Errorf("artifact session: %s: %s", res.Status, strings.TrimSpace(string(snippet)))
+	}
+	var out struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("artifact session: decode: %w", err)
+	}
+	return out.URL, nil
+}

@@ -18,7 +18,9 @@ import (
 	"syscall"
 	"time"
 
+	"gitea.com/gitea/runner/act/common"
 	"github.com/feed-mob/feedmob-orrery/internal/gate"
+
 	"github.com/feed-mob/feedmob-orrery/internal/server"
 	"github.com/feed-mob/feedmob-orrery/internal/store"
 )
@@ -56,6 +58,15 @@ func main() {
 			"chat webhook that receives a message when a workflow's verdict changes (Slack-shaped {\"text\"}); only changes are sent, not every run")
 		defaultConc = flag.String("default-concurrency", "${{ github.workflow }}@${{ github.ref }}",
 			"concurrency group applied to a workflow that declares none; runs sharing a group queue rather than race. Empty restores GitHub's behaviour of no limit")
+		artifactDir = flag.String("artifact-dir", "",
+			"directory for the shared artifact store; empty leaves each runner storing artifacts on its own disk, "+
+				"which only works while there is one runner")
+		artifactAddr = flag.String("artifact-addr", ":34567",
+			"listen address for the shared artifact store; job containers must be able to route to it")
+		artifactHost = flag.String("artifact-host", os.Getenv("ORRERY_ARTIFACT_HOST"),
+			"host:port job containers reach the artifact store on; derived from -artifact-addr when empty, "+
+				"which is wrong whenever this server is behind NAT or in a container itself")
+
 		verbose = flag.Bool("v", false, "debug logging")
 	)
 	flag.Parse()
@@ -137,6 +148,50 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if *artifactDir != "" {
+		if err := os.MkdirAll(*artifactDir, 0o755); err != nil {
+			log.Error("artifact dir", "path", *artifactDir, "err", err)
+			os.Exit(1)
+		}
+		host := *artifactHost
+		if host == "" {
+			host = reachableHost(*artifactAddr)
+		}
+		store, err := server.NewArtifactStore(*artifactDir, host, log)
+		if err != nil {
+			log.Error("artifact store", "err", err)
+			os.Exit(1)
+		}
+		defer store.Close()
+		srv.UseArtifactStore(store)
+
+		as := &http.Server{
+			Addr:              *artifactAddr,
+			Handler:           store.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = as.Shutdown(shutdownCtx)
+		}()
+		go func() {
+			// Its own listener rather than a path under the main mux: act
+			// builds the URLs it hands back to upload-artifact out of the
+			// request's Host header with no prefix of its own, so anything
+			// mounted under a path would answer once and then send the client
+			// to a URL that does not exist.
+			if err := as.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("artifact store serve", "err", err)
+			}
+		}()
+		log.Info("shared artifact store listening", "addr", *artifactAddr, "url", store.URL(), "dir", *artifactDir)
+	} else {
+		log.Warn("no -artifact-dir: each runner stores artifacts on its own disk, so a download-artifact " +
+			"finds nothing unless the same runner happened to run the upload")
+	}
 
 	go srv.RunReaper(ctx)
 	go srv.RunScheduler(ctx)
@@ -326,4 +381,26 @@ func keysOfEnv(m map[string]map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// reachableHost turns a listen address into one a job container can dial.
+//
+// A container cannot reach "localhost" — that is its own loopback — so a
+// wildcard bind is resolved to this host's outbound IP, the same address the
+// runner-local servers advertise. It is a guess, and the machine where it
+// guesses wrong (behind NAT, or this server itself in a container) is exactly
+// the machine whose operator should set -artifact-host.
+func reachableHost(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		if ip := common.GetOutboundIP(); ip != nil {
+			host = ip.String()
+		} else {
+			host = "127.0.0.1"
+		}
+	}
+	return net.JoinHostPort(host, port)
 }

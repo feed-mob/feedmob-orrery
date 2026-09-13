@@ -23,15 +23,23 @@ import (
 // They run in the runner process and bind to an address the job container can
 // route to. That is act's design and Gitea's deployment, and it carries one
 // consequence worth stating plainly: artifacts and caches are local to the
-// runner that produced them. With one runner that is invisible. With several,
-// a download-artifact in a downstream job only finds the upload if the same
-// runner happened to take both jobs. A central store is the fix, and it is not
-// this change.
+// runner that produced them. With one runner that is invisible. With several, a
+// download-artifact in a downstream job only finds the upload if the same
+// runner happened to take both jobs.
+//
+// The artifact half of that is fixed when the control plane offers a shared
+// store: the local server is not started, and steps are pointed at the control
+// plane instead (see remoteArtifacts). The cache half is not, and the reason is
+// worth recording — a cache miss is a slow build, while a missing artifact is a
+// broken one, so the two do not deserve the same amount of machinery.
 type services struct {
 	artifactDir  string
 	artifactAddr string
 	artifactPort string
-	cache        *artifactcache.Handler
+	// remoteArtifacts is the control plane's artifact URL, non-empty when this
+	// runner uses the shared store rather than serving its own.
+	remoteArtifacts string
+	cache           *artifactcache.Handler
 	// token is what steps present to the cache server. One per runner process,
 	// registered against the job's repository for as long as the job runs, so a
 	// leaked token stops working when the job ends.
@@ -56,7 +64,20 @@ func startServices(ctx context.Context, opts Options, log *slog.Logger) (*servic
 		}
 	}
 
-	if !opts.NoArtifacts {
+	if !opts.NoArtifacts && opts.ArtifactURL != "" {
+		// Shared store: the control plane serves the protocol and this runner
+		// serves nothing. act reads both of these from the process environment
+		// before falling back to its own config
+		// (act/runner/run_context.go:1141), which is the only seam act offers
+		// — and the reason the credential is per runner rather than per job.
+		s.remoteArtifacts = opts.ArtifactURL
+		if opts.ArtifactToken != "" {
+			s.token = opts.ArtifactToken
+		}
+		_ = os.Setenv("ACTIONS_RUNTIME_URL", strings.TrimSuffix(opts.ArtifactURL, "/")+"/")
+		_ = os.Setenv("ACTIONS_RUNTIME_TOKEN", s.token)
+		log.Info("using the control plane's shared artifact store", "url", opts.ArtifactURL)
+	} else if !opts.NoArtifacts {
 		s.artifactDir = filepath.Join(opts.WorkDir, "artifacts")
 		if err := os.MkdirAll(s.artifactDir, 0o755); err != nil {
 			return nil, fmt.Errorf("artifact dir: %w", err)
@@ -147,6 +168,14 @@ func (w slogWriter) Write(p []byte) (int, error) {
 func (s *services) artifactPathOr(def string) string {
 	if s == nil {
 		return def
+	}
+	if s.remoteArtifacts != "" {
+		// act never reads this path — it is a flag, and the only thing it
+		// gates is whether ACTIONS_RUNTIME_URL and ACTIONS_RUNTIME_TOKEN are
+		// exported to the step at all (act/runner/run_context.go:1121). With a
+		// shared store there is no local directory to name, and leaving it
+		// empty would silently switch artifacts off.
+		return "shared"
 	}
 	return s.artifactDir
 }

@@ -273,3 +273,21 @@ func (s *Store) UsageSince(ctx context.Context, since time.Time) ([]Usage, error
 	}
 	return out, rows.Err()
 }
+
+// RunnerHoldsRun reports whether this runner currently has a job running in
+// this run. It is the authorization check behind the shared artifact store: a
+// runner may read and write the artifacts of the runs it is executing, and no
+// others.
+//
+// "running" and not "ever claimed" is deliberate. An artifact credential that
+// stayed valid after the job ended would be a credential that a leaked job log
+// turns into standing access; tying it to the job's own lifetime means the
+// window closes when the job does.
+func (s *Store) RunnerHoldsRun(ctx context.Context, runnerID, runID int64) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE runner_id = ? AND run_id = ? AND status = 'running'`,
+		runnerID, runID).Scan(&n)
+	return n > 0, err
+}
