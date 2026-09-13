@@ -39,6 +39,13 @@ act 的文档自己列明：`concurrency`、`timeout-minutes`、`permissions`、
 
 **而 (b) 恰好是我们全部四个痛点的所在**（超时缺失、消费上限、重复 deploy.yml、部署卡死）。所以"复用执行器"省下的是我们最不缺的那一半，(b) 一行都没省。这不改变要取代 GitHub Actions 的决定，只是把工作量说清楚。
 
+> **2026-09-13 实现进度**：(a) 与 (b) 都已落地并端到端验证。act 文档里那串 "ignored"——
+> `concurrency`、`timeout-minutes`、取消、step summary——现在由服务端提供：并发组默认开启、
+> 超时 NOT NULL 有平台默认值、停止是"请求→确认→超时强杀"三态、步骤时间线落库。
+> 触发（webhook / schedule / workflow_dispatch）与回写（commit status）也在服务端。
+> 唯一还在 (b) 里没做的 P0 项是 `permissions:` 收窄 token——它需要先有 GitHub App
+> 才能铸造收窄的凭据，是部署决策而不是代码缺口。详见 README 的能力表。
+
 ```
 ┌─────────────────────────────────────────────┐
 │ L1  管道定义 · workflow 语法                  │  兼容

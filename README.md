@@ -137,7 +137,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 |---|---|
 | workflow 解析（`jobs` / `needs` / `runs-on` / `timeout-minutes` / `env` / `run` 步骤） | ✅ 含依赖环检测与未知 `needs` 校验 |
 | runner.v1 协议（`Register` / `Declare` / `FetchTask` / `UpdateTask` / `UpdateLog`） | ✅ Connect 风格 JSON over HTTP |
-| 调度：`needs` DAG、标签匹配、原子抢占 | ✅ 上游失败时下游标 `skipped` 而非永久阻塞 |
+| 调度：`needs` DAG、标签匹配、原子抢占 | ✅ 上游落定后由 `if:` 决定跑还是标 `skipped`，不会永久阻塞 |
 | 日志流：增量提交 + 服务端 ack 定义投递 | ✅ 重复窗口幂等，跳跃窗口被拒 |
 | **带确认的停止**：请求 → 确认 → 超时强杀 | ✅ 台账区分 `cleanup_ran=true/false`；被打断的步骤记 `cancelled` 而非 `failure` |
 | 平台级默认超时 | ✅ 作者可下调，不可遗漏 |
@@ -160,12 +160,12 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 ### 接到 GitHub 上
 
 ```bash
-./bin/orrery-server -db orrery.db \
-  -forge-token "$(gh auth token)" \        # 读 workflow 文件、回写状态
-  -webhook-secret "$(openssl rand -hex 32)" \
-  -public-url https://orrery.example.com \
-  -secrets secrets.env
+./bin/orrery-server -db orrery.db -secrets secrets.env -forge-token "$(gh auth token)" -webhook-secret "$ORRERY_WEBHOOK_SECRET" -public-url https://orrery.example.com
 ```
+
+`-forge-token` 用来读 workflow 文件和回写状态；`-webhook-secret` 是 GitHub 那边
+填的同一个值（`openssl rand -hex 32` 生成）；`-public-url` 是 commit status 点过去
+的地址。
 
 仓库 Settings → Webhooks 里指向 `https://…/api/webhooks/github`，content type
 `application/json`，secret 填同一个值，勾选 push / pull request。
