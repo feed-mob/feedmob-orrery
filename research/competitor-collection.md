@@ -533,7 +533,7 @@ FeedMob 的痛点里没有一条是"CI 跑得慢"——全部是治理和确定�
 | 事实 | 独立复核结果（2026-09-12，`gh api` 现查） |
 |---|---|
 | **act 已停更** | master 最后提交 **2026-06-01**（只是版本号 bump）；最后一次真实代码改动是 05-13 的依赖升级。release 节奏原本每月 1 号（04-01 / 05-01 / 06-01）**然后断了三个多月**。114 个开放 PR、266 个开放 issue |
-| **`gitea/act` 已归档** | `archived=true`，仓库描述原文 *"Merged into act_runner"* |
+| **`gitea/act` 已归档** | `archived=true`，仓库描述原文 "Merged into act_runner" |
 | **正确的 fork 目标** | `gitea.com/gitea/runner` 的 `act/` 目录（MIT）。该仓库两周内发了五个版本：v3.3.1(08-26)、v3.3.2(08-31)、v3.4.0(09-07)、v3.4.1(09-08)、v3.4.2(09-09) |
 
 > ⚠ 一个陷阱：`nektos/act` 的 `pushed_at` 显示 2026-08-09，看着像还活着——**那是推到非默认分支的**。master 是真停了。
@@ -572,7 +572,7 @@ act 的文档自己列明：`concurrency`、`timeout-minutes`、`permissions`、
 | 发现 | 含义 |
 |---|---|
 | **Temporal 无成本概念** | 计费止步 Namespace 级，`temporal_cloud_v1_billable_action_count` 约 3 分钟延迟，**无 per-run 成本字段、无按成本硬停**。卡片标记 `avoid` |
-| **LiteLLM 已解决成本归属** | `agent_id` / `session_id` 是真实建表列，`max_budget_per_session` 是运行时硬闸。FeedMob **已经在用** |
+| **LiteLLM 已解决成本归属** | `agent_id` / `session_id` 是真实建表列，日聚合表 `LiteLLM_DailyAgentSpend` 专为 agent 设计。FeedMob **已经在用**。⚠ 但 `max_budget_per_session` 不是硬闸（§2.5 ②） |
 | **Tekton/Argo 被迫拆开执行与台账** | Tekton Results 的动机明写是给 etcd 腾地方。三家都是被规模逼着拆的 |
 
 **提案**：
