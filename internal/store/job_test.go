@@ -63,3 +63,58 @@ func TestRunByIDCarriesTheStepTimeline(t *testing.T) {
 		t.Errorf("after upsert: %+v", got)
 	}
 }
+
+// The scheduler asks the gate; the gate is what knows about `if:`. Without one
+// the store keeps its pre-`if:` behaviour, which is what makes it safe to use
+// the store on its own.
+func TestPropagateAsksTheGate(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	var asked []string
+	st.UseJobGate(func(run *Run, payload, key string, upstream map[string]string, cancelled bool) (bool, error) {
+		asked = append(asked, key)
+		if run == nil || run.Repo != "feed-mob/app" {
+			t.Errorf("gate got run %+v; a gate that cannot see the run answers false silently", run)
+		}
+		if upstream["build"] != "failure" {
+			t.Errorf("gate saw upstream %v, want build=failure", upstream)
+		}
+		// Stand in for `if: always()` on notify only.
+		return key == "notify", nil
+	})
+
+	runID, err := st.CreateRun(ctx, Run{Repo: "feed-mob/app", WorkflowName: "w"}, []NewJob{
+		{Key: "build", Payload: "p"},
+		{Key: "deploy", Needs: []string{"build"}, Payload: "p"},
+		{Key: "notify", Needs: []string{"build"}, Payload: "p"},
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sum, _ := st.RunByID(ctx, runID)
+	var buildID int64
+	for _, j := range sum.Jobs {
+		if j.Key == "build" {
+			buildID = j.ID
+		}
+	}
+	if _, err := st.FinishJob(ctx, buildID, "failure"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	sum, _ = st.RunByID(ctx, runID)
+	got := map[string]string{}
+	for _, j := range sum.Jobs {
+		got[j.Key] = j.Status + "/" + j.Result
+	}
+	if got["deploy"] != "done/skipped" {
+		t.Errorf("deploy = %q, want done/skipped", got["deploy"])
+	}
+	if got["notify"] != "queued/" {
+		t.Errorf("notify = %q, want queued — the gate said it should run", got["notify"])
+	}
+	if len(asked) != 2 {
+		t.Errorf("gate was asked about %v, want both dependents", asked)
+	}
+}

@@ -29,6 +29,9 @@ var ErrNotFound = errors.New("not found")
 type Store struct {
 	db  *sql.DB
 	now func() time.Time
+	// gate decides whether a blocked job runs once its upstreams settle. nil
+	// means the default: run iff every upstream succeeded.
+	gate JobGate
 }
 
 // Open opens (and migrates) the database at path.
@@ -48,6 +51,10 @@ func Open(path string) (*Store, error) {
 	}
 	return &Store{db: db, now: time.Now}, nil
 }
+
+// UseJobGate installs the `if:` policy. Called once at startup, before any run
+// exists, so there is nothing to race with.
+func (s *Store) UseJobGate(g JobGate) { s.gate = g }
 
 // addColumns brings a database created by an earlier build up to date.
 //

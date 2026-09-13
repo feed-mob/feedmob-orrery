@@ -134,7 +134,7 @@ func (s *Store) FinishJob(ctx context.Context, jobID int64, result string) (*Run
 		UPDATE runners SET status = 'idle' WHERE id = (SELECT runner_id FROM jobs WHERE id = ?)`, jobID); err != nil {
 		return nil, err
 	}
-	outcome, err := propagate(ctx, tx, runID, now)
+	outcome, err := propagate(ctx, tx, runID, now, s.gate)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +159,11 @@ type RunOutcome struct {
 
 // propagate walks the run's blocked jobs and moves each one forward once its
 // upstreams have settled.
-func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string) (*RunOutcome, error) {
+func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string, g JobGate) (*RunOutcome, error) {
+	meta, err := runInTx(ctx, tx, runID)
+	if err != nil {
+		return nil, err
+	}
 	results := map[string]string{}
 	statuses := map[string]string{}
 	rows, err := tx.QueryContext(ctx, `SELECT job_key, status, result FROM jobs WHERE run_id = ?`, runID)
@@ -179,23 +183,26 @@ func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string) (*RunOu
 		return nil, err
 	}
 
-	blocked, err := tx.QueryContext(ctx, `SELECT id, job_key, needs FROM jobs WHERE run_id = ? AND status = 'blocked'`, runID)
+	blocked, err := tx.QueryContext(ctx,
+		`SELECT id, job_key, needs, payload FROM jobs WHERE run_id = ? AND status = 'blocked'`, runID)
 	if err != nil {
 		return nil, err
 	}
 	type pending struct {
-		id    int64
-		needs []string
+		id      int64
+		key     string
+		needs   []string
+		payload string
 	}
 	var list []pending
 	for blocked.Next() {
 		var id int64
-		var key, needsRaw string
-		if err := blocked.Scan(&id, &key, &needsRaw); err != nil {
+		var key, needsRaw, payload string
+		if err := blocked.Scan(&id, &key, &needsRaw, &payload); err != nil {
 			blocked.Close()
 			return nil, err
 		}
-		list = append(list, pending{id: id, needs: decodeStrings(needsRaw)})
+		list = append(list, pending{id: id, key: key, needs: decodeStrings(needsRaw), payload: payload})
 	}
 	blocked.Close()
 	if err := blocked.Err(); err != nil {
@@ -203,25 +210,32 @@ func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string) (*RunOu
 	}
 
 	for _, p := range list {
-		ready, doomed := true, false
+		ready := true
+		upstream := make(map[string]string, len(p.needs))
+		cancelled := false
 		for _, n := range p.needs {
 			if statuses[n] != "done" {
 				ready = false
 				break
 			}
-			if r := results[n]; r == "failure" || r == "cancelled" {
-				doomed = true
+			upstream[n] = results[n]
+			if results[n] == "cancelled" {
+				cancelled = true
 			}
 		}
 		if !ready {
 			continue
 		}
-		if doomed {
-			// An upstream failed. Skipping is the GitHub-compatible result and
-			// it beats leaving the job blocked until a human notices.
+		run, reason, err := g.decide(meta, p.payload, p.key, upstream, cancelled)
+		if err != nil {
+			return nil, err
+		}
+		if !run {
+			// Skipping is the GitHub-compatible result for a job whose `if:`
+			// says no, and it beats leaving it blocked until a human notices.
 			if _, err := tx.ExecContext(ctx, `
-				UPDATE jobs SET status = 'done', result = 'skipped', stop_reason = 'upstream_failed',
-				                stopped_at = ? WHERE id = ?`, now, p.id); err != nil {
+				UPDATE jobs SET status = 'done', result = 'skipped', stop_reason = ?,
+				                stopped_at = ? WHERE id = ?`, reason, now, p.id); err != nil {
 				return nil, err
 			}
 			continue
@@ -579,3 +593,49 @@ func MarshalNeeds(v any) string {
 }
 
 var _ = fmt.Sprintf
+
+// JobGate decides whether a blocked job runs now that its upstreams have
+// settled. It is injected rather than implemented here so the store stays SQL:
+// evaluating `if:` needs an expression interpreter and a workflow model, and
+// neither belongs in the layer that owns the transaction.
+//
+// The default below is the pre-`if:` behaviour, so a store used without a gate
+// still schedules correctly for the common case.
+// The run is passed whole because a job-level `if:` may read any of the github
+// context — `github.ref`, `github.event_name`, `github.event.*` — and a gate
+// that cannot see them does not fail, it quietly answers false.
+type JobGate func(run *Run, payload, jobKey string, upstream map[string]string, runCancelled bool) (bool, error)
+
+func (g JobGate) decide(r *Run, payload, key string, upstream map[string]string, cancelled bool) (bool, string, error) {
+	if g != nil {
+		run, err := g(r, payload, key, upstream, cancelled)
+		if err != nil {
+			return false, "", err
+		}
+		if run {
+			return true, "", nil
+		}
+		return false, "if_false", nil
+	}
+	for _, r := range upstream {
+		if r != "success" {
+			return false, "upstream_failed", nil
+		}
+	}
+	return true, "", nil
+}
+
+// runInTx reads the run's identity inside the caller's transaction, so the gate
+// sees the same snapshot the scheduling decision is made against.
+func runInTx(ctx context.Context, tx *sql.Tx, runID int64) (*Run, error) {
+	var r Run
+	err := tx.QueryRowContext(ctx, `
+		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result,
+		       event_payload, run_number
+		FROM runs WHERE id = ?`, runID).Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile,
+		&r.Event, &r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &r.EventPayload, &r.RunNumber)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return &r, err
+}

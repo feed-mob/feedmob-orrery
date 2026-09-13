@@ -145,7 +145,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **跨 job 传值**（#40） | ✅ `needs.<job>.outputs.*` 与 `needs.<job>.result` |
 | **状态回写**（#47） | ✅ Commit Status API，`orrery / <workflow>`；入队 pending、落定终态 |
 | **产物与缓存**（#27 #28） | ✅ runner 内置产物与缓存服务端；跨 job 传产物已验证。**必须钉 v3**，见下 |
-| job 级 `if:`（`always()` / `failure()`） | ⛔ 调度器目前把下游一律标 skipped |
+| **job 级 `if:`** | ✅ `always()` / `failure()` / `cancelled()` 与任意表达式，用 act 自己的解释器求值 |
 | `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
 
 ### 接到 GitHub 上

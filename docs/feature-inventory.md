@@ -33,8 +33,9 @@ P0 的骨架与执行器都已跑通，以下条目**已验证可用**，不再�
 | 47 | **状态回写** | Commit Status API，context `orrery / <workflow>`；入队 pending、落定终态 |
 | 67 | 幂等键 | webhook delivery id |
 
-**下一项**是 job 级 `if:`（`always()` / `failure()`）——调度器目前在上游失败时把下游一律标 skipped，
-所以"失败时通知"这类 job 不会跑。
+| 10 | job 级 `if:` | `examples/conditional.yml`：build 失败后 deploy skipped、`if: always()` 的 notify 与 `if: failure()` 的 rollback 都跑了 |
+
+**下一项**是 `concurrency` 并发组——两次快速 push 同时部署是真实风险，GitHub 有 `cancel-in-progress`，我们还没有。
 
 **已知边界**（见 README）：`GITHUB_API_URL` 对 github.com 是错的（`gitea/runner` v1.0.8 硬编码 Gitea 的 API 形状，无配置开关）；
 host 模式的 job 继承 runner 进程的环境变量；产物与缓存 action 必须钉 `@v3`，且属于产生它的那台 runner。

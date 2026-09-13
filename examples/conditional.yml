@@ -1,0 +1,37 @@
+# job 级 if:：失败后该跑的 job 要真的跑。
+name: Conditional
+
+on: [push]
+
+jobs:
+  build:
+    name: Build
+    runs-on: [self-hosted]
+    steps:
+      - name: Fail on purpose
+        run: |
+          echo "building..."
+          exit 1
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: [self-hosted]
+    steps:
+      - run: echo "should NOT run"
+
+  notify:
+    name: Notify
+    needs: build
+    if: always()
+    runs-on: [self-hosted]
+    steps:
+      - run: echo "NOTIFY RAN (always)"
+
+  rollback:
+    name: Rollback
+    needs: build
+    if: failure()
+    runs-on: [self-hosted]
+    steps:
+      - run: echo "ROLLBACK RAN (failure)"

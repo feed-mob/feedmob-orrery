@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/feed-mob/feedmob-orrery/internal/gate"
 	"github.com/feed-mob/feedmob-orrery/internal/server"
 	"github.com/feed-mob/feedmob-orrery/internal/store"
 )
@@ -53,6 +55,20 @@ func main() {
 	}
 	defer st.Close()
 
+	// Teach the scheduler what `if:` means. Without it every dependent of a
+	// failed job is skipped, so `if: always()` and `if: failure()` jobs — the
+	// ones that exist precisely to run after a failure — never run.
+	vars := envWithPrefix("ORRERY_VAR_")
+	st.UseJobGate(func(run *store.Run, payload, key string, upstream map[string]string, runCancelled bool) (bool, error) {
+		return gate.Decide(payload, key, upstream, gate.Env{
+			Github: gate.GithubFor(run.Repo, run.Ref, run.SHA, run.Actor, run.Event,
+				run.WorkflowName, strconv.FormatInt(run.ID, 10),
+				strconv.FormatInt(run.RunNumber, 10), run.EventPayload),
+			Vars:         vars,
+			RunCancelled: runCancelled,
+		})
+	})
+
 	secrets, err := loadSecrets(*secretsFile)
 	if err != nil {
 		log.Error("read secrets", "path", *secretsFile, "err", err)
@@ -62,7 +78,7 @@ func main() {
 		RegistrationToken: *regToken,
 		StopGrace:         *grace,
 		Secrets:           secrets,
-		Vars:              envWithPrefix("ORRERY_VAR_"),
+		Vars:              vars,
 		Forge:             server.Forge{URL: *forgeURL, APIURL: *forgeAPI},
 		ForgeToken:        *forgeToken,
 		WebhookSecret:     *hookSecret,
