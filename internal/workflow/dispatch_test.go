@@ -77,11 +77,14 @@ func TestValidateDispatch(t *testing.T) {
 	if got["environment"] != "production" || got["version"] != "latest" {
 		t.Errorf("defaults not filled in: %+v", got)
 	}
-	if got["dry_run"] != false {
-		t.Errorf("dry_run = %#v, want a real boolean", got["dry_run"])
+	// Strings, not Go types: that is what the forge puts in the event, and act
+	// converts a boolean input with `value == "true"`. A real JSON true there
+	// compares false, and a dry_run guard does the opposite of what was asked.
+	if got["dry_run"] != "false" {
+		t.Errorf("dry_run = %#v, want the string \"false\"", got["dry_run"])
 	}
-	if got["replicas"] != float64(2) {
-		t.Errorf("replicas = %#v, want a number", got["replicas"])
+	if got["replicas"] != "2" {
+		t.Errorf("replicas = %#v, want the string \"2\"", got["replicas"])
 	}
 
 	if _, err := ValidateDispatch(declared, nil); err == nil {
@@ -97,5 +100,15 @@ func TestValidateDispatch(t *testing.T) {
 	}
 	if _, err := ValidateDispatch(declared, map[string]string{"environment": "staging", "replicas": "many"}); err == nil {
 		t.Error("a non-numeric value for a number input was accepted")
+	}
+
+	// ParseBool takes "1", "TRUE" and "T"; act only recognises "true". The
+	// normalisation is what keeps those from silently meaning false.
+	norm, err := ValidateDispatch(declared, map[string]string{"environment": "staging", "dry_run": "TRUE"})
+	if err != nil {
+		t.Fatalf("ValidateDispatch: %v", err)
+	}
+	if norm["dry_run"] != "true" {
+		t.Errorf("dry_run = %q, want the normalised \"true\"", norm["dry_run"])
 	}
 }

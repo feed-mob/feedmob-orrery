@@ -599,6 +599,11 @@ function inputField(name, spec, state) {
       onchange: e => set(e.target.value),
     });
   }
+  // What is shown is what gets sent. A required choice has no default, so the
+  // select displays its first option while the state still holds "" — the form
+  // then submits an empty value for a field the user can see is filled in, and
+  // the server rejects something nobody typed.
+  if (control.value !== undefined && control.value !== '') set(control.value);
   return el('div', { class: 'row field' },
     el('label', {}, name, spec.required ? el('span', { class: 'fail' }, ' *') : null),
     control,

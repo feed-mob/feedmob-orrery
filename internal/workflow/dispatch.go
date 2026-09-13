@@ -75,13 +75,20 @@ func (wf *Workflow) DispatchInputs() (map[string]DispatchInput, bool, error) {
 }
 
 // ValidateDispatch checks what an operator supplied against what the workflow
-// declared, and fills in the defaults.
+// declared, fills in the defaults, and returns the values as strings.
+//
+// Strings, not the Go types the declarations imply, because that is what the
+// forge puts in a workflow_dispatch event and what every consumer downstream
+// expects to find there. act converts a boolean input with `value == "true"`;
+// hand it a real JSON `true` and the comparison is false, so a `dry_run: true`
+// arrives in the job as `false` — the guard does the opposite of what was
+// asked, with nothing anywhere saying so.
 //
 // Refusing an unknown input matters more than it looks: a typo'd `enviroment`
 // would otherwise be accepted, the real `environment` would take its default,
 // and a deploy would go to the wrong place with nothing in the log to say why.
-func ValidateDispatch(declared map[string]DispatchInput, given map[string]string) (map[string]any, error) {
-	out := map[string]any{}
+func ValidateDispatch(declared map[string]DispatchInput, given map[string]string) (map[string]string, error) {
+	out := map[string]string{}
 	for name := range given {
 		if _, ok := declared[name]; !ok {
 			return nil, fmt.Errorf("input %q is not declared by this workflow", name)
@@ -101,17 +108,18 @@ func ValidateDispatch(declared map[string]DispatchInput, given map[string]string
 			if err != nil {
 				return nil, fmt.Errorf("input %q must be a boolean, got %q", name, v)
 			}
-			out[name] = b
+			// Normalised: "TRUE", "1" and "yes" all mean the same thing to
+			// ParseBool but only "true" means it to act.
+			out[name] = strconv.FormatBool(b)
 		case "number":
 			if v == "" {
 				out[name] = ""
 				continue
 			}
-			n, err := strconv.ParseFloat(v, 64)
-			if err != nil {
+			if _, err := strconv.ParseFloat(v, 64); err != nil {
 				return nil, fmt.Errorf("input %q must be a number, got %q", name, v)
 			}
-			out[name] = n
+			out[name] = v
 		case "choice":
 			if len(in.Options) > 0 && !contains(in.Options, v) {
 				return nil, fmt.Errorf("input %q must be one of %s, got %q",

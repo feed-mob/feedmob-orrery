@@ -347,8 +347,8 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// GitHub puts the values under github.event.inputs, and workflows read them
-	// there; `inputs.*` is the newer spelling of the same thing.
+	// GitHub puts the values under github.event.inputs, as strings, and both
+	// `github.event.inputs.*` and the newer `inputs.*` are read from there.
 	payload, err := json.Marshal(map[string]any{
 		"inputs":   inputs,
 		"ref":      ref,
@@ -374,13 +374,13 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	s.wake.broadcast()
 	s.log.Info("workflow dispatched", "run", runID, "repo", req.Repo,
-		"workflow", file.Path, "ref", ref, "inputs", keysOfAny(inputs))
+		"workflow", file.Path, "ref", ref, "inputs", inputNames(inputs))
 	writeJSON(w, http.StatusOK, SubmitResponse{RunID: runID, Jobs: wf.JobOrder})
 }
 
-// keysOfAny logs which inputs were supplied without logging their values: a
-// dispatch input is a plausible place for someone to paste a token.
-func keysOfAny(m map[string]any) []string {
+// inputNames logs which inputs were supplied without logging their values: a
+// manual input box is a plausible place for someone to paste a token.
+func inputNames(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
