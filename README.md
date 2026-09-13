@@ -334,11 +334,28 @@ Gitea 的 API 形状（`<forge>/api/v1`，且把 `GITHUB_GRAPHQL_URL` 置空）�
 修它意味着把 act 那棵树接管过来自己维护，而不是继续跟上游——这是产品决策，不是补丁，
 见 charter 的 (a)/(b) 分工。
 
-**容器里的步骤偶发会卡住不返回。** 在本机（Colima）跑产物用例时见过两次：
+**容器里的步骤会卡住不返回——这是 Colima 的问题，不是 act 的。** 在本机跑产物用例时反复出现：
 `actions/cache` 的 post 步骤已经打印完 "Cache saved successfully"，但 act 的
 `waitForCommand` 还在等 docker exec 的输出流关闭，流一直没关。栈在 act 的容器层（`waitForCommand`
 还在等 docker exec 的输出流关闭），不在我们的代码里——两次 goroutine dump 里都没有
-Orrery 自己的 goroutine。
+Orrery 自己的 goroutine。超时打断时露出的错误点名了真正的原因：
+
+```
+Get ".../containers/.../archive?path=/var/run/act/workflow/pathcmd.txt": context deadline exceeded
+```
+
+act 在读容器里的 `$GITHUB_PATH` 文件，**这个 Docker API 调用不返回**。
+对照实验（每组独立跑）：
+
+| 用例 | 结果 |
+|---|---|
+| 只用 `upload/download-artifact` | 2/2 正常 |
+| 用 `actions/cache` | 2/2 卡死 |
+
+cache 的 post 步骤刚好是 Docker API 流量最大的时刻（把一整个 tar 包穿过容器网络写到
+宿主机），之后紧接着的那次 archive 读取就挂住。Colima 本身不缺资源（6 CPU / 12GiB /
+60GiB，镜像才占 2GB）。**这大概率是 Docker-on-macOS（virtiofs + VM）特有的，
+生产用 Linux 原生 Docker 应该遇不到——但这一条需要在真机上验证。**
 
 **兜底是两层独立的超时，都实测过**：
 
