@@ -15,7 +15,7 @@
 | # | 维 | 来源 | 做法 | 对 Orrery 的意义 |
 |---|---|---|---|---|
 | 1 | D5 | **Devin** | ACU 用**减法**定义：等人回话、等测试、clone 仓库一律**不计费**；30 分钟无活动自动 sleep | 让"人在环中"与"成本控制"不再对立。别家按时长计费时，每设一道审批门都在烧钱，产品就本能地少设门 |
-| 2 | D5 | **LiteLLM**（已在用） | `agent_id` / `session_id` 是**真实建表列**，`max_budget_per_session` 是运行时硬闸 | Orrery 不要自建成本表。把 `run_id` 绑进 `x-litellm-trace-id`，**OQ-2 变成一次聚合查询** |
+| 2 | D5 | **LiteLLM**（已在用） | `agent_id`/`session_id` 是**真实建表列**，另有按 agent 归集的 `LiteLLM_DailyAgentSpend` 日聚合表 ⚠ 但 `max_budget_per_session` **不是硬闸**（见 §2.5） | 台账可直接用——`run_id` 绑进 `x-litellm-trace-id`，**OQ-2 变成一次聚合查询**。但**熔断必须 Orrery 自己做** |
 | 3 | D8 | **gh-aw** | agent 永远只读；写操作吐结构化 JSON 请求，由另一个按操作类型授最小权限的 job 落地。约 50 种 safe output，每种带 `max:` 上限 | 部署域直接照抄：agent job 不持有 SSH 凭据，只能产出 `{"type":"deploy","target":...}`。681 行 deploy.yml 里真正危险的只有几个动词 |
 | 4 | D3 | **Temporal** | 取消拆成两条事件（`CancelRequested` / `Canceled`）+ 强杀第三态；清理代码放 `nonCancellable` 作用域，**取消信号进不去** | 印证 Mobius 的 `stopRequestedAt`/`stopAckedAt` 是对的，并补上第三态。"两次生产对话永久失声"的正解 |
 | 5 | D1 | **WorkOS** | 令牌用 `sub` + `act` 双 claim 同时表达"谁在干"和"谁授权的"，全程复用 RFC 8693，无私有协议 | Mobius 在工单层区分了分配 vs 委派，但**委派没落到令牌上**。补上这半，D7 判 `act`、D12 两列不塌缩、D5 可双维度切 |
@@ -55,19 +55,29 @@
 |---|---|---|
 | **深潜** | 5 × [调研 → 对抗核验] = 10 | 5 个目标、78 张卡 |
 | **群扫** | 10 组 + 墓碑考古 = 11 | 50 个产品、80 张卡、14 块墓碑 |
-| **口碑挖掘** | 13 | 独立用户来源交叉验证、141 条声称裁定 |
+| **口碑挖掘** | 13 | 39 个产品的用户口碑块、125 条声称裁定（56 升 A / 49 维持 B / **20 条被推翻**） |
 
-**对抗核验的作用是真实的**：深潜阶段调研员自评给出的等级，被核验员逐条访问 URL 之后**全部降级**——78 张卡最终 58 张 B、20 张 C，**零张 A**。其中一张 Claude Managed Agents 的停止语义卡被抓到**引用错页**（`session-operations` 页根本没有它引的那段话），直接降 C。
+**两道核验都起了作用。** 第一道（对抗核验）：：深潜阶段调研员自评给出的等级，被核验员逐条访问 URL 之后**全部降级**——78 张卡最终 58 张 B、20 张 C，**零张 A**。其中一张 Claude Managed Agents 的停止语义卡被抓到**引用错页**（`session-operations` 页根本没有它引的那段话），直接降 C。
 
 ### 1.2 证据等级，以及为什么 A 级这么少
 
-| 等级 | 定义 | 本次数量 |
-|---|---|---|
-| **A** | 官方文档/代码 **+ ≥2 个独立用户来源** | 6 |
-| **B** | 仅官方文档或源码 | 169 |
-| **C** | 仅厂商声称 | 20 |
+口碑挖掘的 13 个 agent 对 125 条文档级声称逐条去找独立用户来源，裁定结果：
 
-**这个分布本身是发现**：绝大多数竞品能力**只有厂商文档说它存在**，没有可查证的用户在真实环境里印证它成立。做技术选型时，B 级 = "文档这么写的"，不等于"它在真实环境里真是这样"。
+| 裁定 | 条数 | 含义 |
+|---|---|---|
+| **upgrade-to-A** | 56 | 找到 ≥2 个独立用户来源印证，升 A |
+| **stays-B** | 49 | 找不到用户层面的证据——这是常态，不是失败 |
+| **contradicted** | **20** | **用户证据反驳了文档**，降 C（见 §2.5） |
+
+最终分布：
+
+| 等级 | 定义 | 数量 |
+|---|---|---|
+| **A** | 官方文档/代码 **+ ≥2 个独立用户来源** | **61**（31%） |
+| **B** | 仅官方文档或源码 | 105 |
+| **C** | 仅厂商声称，或**被用户证据反驳** | 29 |
+
+**20 条被推翻的声称是整轮研究最有价值的产出**——每一条都是"文档这么写、实际不是这样"，而且**有几条正好落在我原本准备抄的设计上**。做技术选型时，B 级 = "文档这么写的"，不等于"它在真实环境里真是这样"。
 
 ### 1.3 竞品全景
 
@@ -310,6 +320,63 @@ agent 永远拿只读 token（`permissions: contents: read, actions: read`），
 **其余**：gh-aw AWF（rootless Docker + squid 出口代理 + **Docker socket 对 agent 隐藏**）、Windmill 两档进程隔离可按脚本粒度开（`ENABLE_UNSHARE_PID` 挡住 `/proc/$pid/mem` 和 worker 环境变量）、Bedrock AgentCore（每 session 独占 microVM，结束后销毁且内存 sanitize）、Managed Agents self-hosted sandbox（**编排与执行切开**：模型与状态机留在 Anthropic，文件系统/进程/出口留在你的机器）。
 
 **⚠ 商品化警报**：E2B 官方定价 vCPU $0.000014/秒、RAM $0.0000045/GiB-秒 → $0.0504/vCPU-小时、$0.0162/GiB-小时。**Daytona 官方定价页标的正是 $0.0504/h 和 $0.0162/h**。两家独立公司的公开定价**精确重合到小数点后四位**——这不是巧合，是没有定价权的表现。**Earthly 教训的前兆齐了，而且比 CI runner 那次更明显。Orrery 不要自建沙箱层。**
+
+---
+
+### 2.5 · 文档说的和实际不符：20 条被推翻的声称 ⚠
+
+口碑挖掘找独立用户来源时，**20 条文档级声称被用户证据反驳**。这些是整轮研究最该先读的部分——**有几条正好落在我原本准备抄的设计上**。
+
+#### 直接影响我们决策的六条
+
+**① gh-aw 的 AI Credits 定价会间歇性整个失败** `D5`
+零配置默认路径（不写 `model` 即解析为 `copilot/auto`）在 AWF 代理里**根本没有定价条目**，每次推理请求被 HTTP 400 拒绝（`missing_model_pricing`）。而且是间歇发作——付费用户 heiskr 报告同一天同组织里两个同样零配置的工作流，**一个反复失败一个成功**，取决于别名解析落到 `copilot/auto` 还是 `large`。官方给的三个 workaround 他直指是"让用户替一个无法定价的默认值背锅"，其中 `models.default-ai-credits-pricing` 相当于"给一个身份未知的模型编一个费率，会让 AIC 账目变成虚构"。
+另有 gh-aw 自己的 collaborator 报告 AIC 计算器对 Anthropic **少算**（错误地从 `input_tokens` 里减掉 `cache_read`）。
+> **含义**：§0.1 里"AI Credits 美元化"那条**只有两级硬顶的形状值得抄，定价实现不值得抄**。
+
+**② LiteLLM 的 `max_budget_per_session` 不是硬闸** `D5` ← 最要紧
+`async_pre_call_hook` **只读取已累计的 spend 做比较，准入时不做任何预留**，而实际成本只在请求成功之后才累加。因此**同一 session 的两个并发请求会读到同一个"未超限"的值，双双放行**。（issue #34732，2026-07-26 提，至今 open）
+另一个实用细节：`agent_id` **没有索引**（只有 `session_id` 有）。
+> **含义**：LiteLLM 的**台账可以直接用**（`LiteLLM_DailyAgentSpend` 确实是为 agent 场景专门设计的），但**熔断必须 Orrery 自己做**，不能依赖它。这恰好印证了 §4.3 的判断——差异化就在"触顶即硬停且必须响"。
+
+**③ gh-aw 自动生成的 concurrency group 对扇出型工作流"基本上永远是错的"** `D14`
+顶层组和 agent 组都按 `inputs.target_repo` 正确分片，**唯独 conclusion job 用的是静态的 `gh-aw-conclusion-<workflow-id>` 组**——于是 50 个并发运行全部排在同一个槽位上一个一个漏下来。报告者原话：对 `workflow_dispatch` 扇出型工作流，这个默认组基本上永远是错的。
+
+**④ Argo CD 的 rollback 在默认 GitOps 配置下不可用** `D19`
+开着 auto-sync 时，要回滚必须**先关掉 auto-sync**；一旦重新打开，Argo 会高高兴兴地再同步回那个刚被回滚掉的 commit。issue #9570：**115 reactions、2022-06 开、至今 open、至少六位独立作者、跨四年未解**。
+> **含义**：§2 D19 里"Argo CD 一键回滚"那条要降级理解。Kamal 那几条（`kamal app version`、`stale_containers`、`ssh.proxy`）没有被推翻。
+
+**⑤ Gitea ephemeral runner 的凭证吊销时机与文档相反** `D13`
+文档写"任务一旦被分配，凭证即被吊销"；实际行为是 **PR #34447 让 ephemeral runner 在任务完成的那一刻才被标记为已删除**——而且正因为吊销发生在跑完之后、有时早于 runner 把日志发完，**导致日志丢失**。
+> **含义**：§2 D13 那张卡的"吊销发生在不可信代码开始跑之前"是错的。Orrery 若要这个语义，得自己实现。
+
+**⑥ Atlantis 的自定义策略检查任何人都能批准** `D20`
+开启 `custom_policy_check: true` 后，所有自定义策略检查被默认塞进一个**未定义的、名为 "Custom" 的 policy set，而那个 set 没有任何审批人限制**——结果是任何人都能批准策略失败。**维护者 2025-02-14 亲口确认了根因。**
+
+#### 其余十四条（摘要）
+
+| 产品 | 被推翻的部分 |
+|---|---|
+| **Windmill** `D9` | 日志脱敏是**路线图不是现状**——创始人自己在 #5450 里把它描述成"还要做的事"；一位 EE 付费用户在 #8268 看到 SSO 的 client ID 和 secret **明文**写进 native worker 的 service log |
+| **Windmill** `D10` | `cache_ttl` 放在 **flow step 上是静默 no-op**，只有写在 `script.yaml` 里才生效；同报告里 `concurrent_limit` 两级**都完全不限流** |
+| **Windmill** `D13` | NSJAIL 隔离**不是进程边界的普遍属性，是按执行器逐个打的补丁**——安全公告 GHSA-2jfj-x8j7-7mfh（2026-09-10，High）承认即便开了 nsjail，DuckDB 脚本仍在 worker 进程内经 FFI 执行，可污染跨工作区共享的依赖缓存 |
+| **Kestra** `D14` | "引擎层保证同一 schedule 不重叠"不成立——`recoverMissedSchedules: LAST` + `concurrency: 1` 时，**同一 trigger 时间起了 3 个 execution，其中 2 个并行跑完**（附 4 张截图，仍开放）。另：UI 上禁用再启用 schedule 会把漏跑的全部补跑，无视 NONE/LAST 设置 |
+| **Activepieces** `D7` | `Wait for Approval` **只有紧跟在 `Create Approval Links` 后面才生效**；中间插一个"发 Slack 消息（带批准链接）"，流程就一路跑完**跳过审批**。报告者原话：那个能正常暂停的版本"功能上毫无用处，因为我没法把这些链接放到任何地方" |
+| **Hatchet** `D7` | `event scope` 隔离是坏的：两个 durable waiter 用同一 event key 但不同 scope 时，**scope-a 的事件可以满足 scope-b 的 waiter**，把 A 场景的 payload 投给 B 的等待者（报告者自标 Severity: Critical） |
+| **Dagster** `D10` | 全局资产页**不把分区已经不同步的资产标成 unsynced**（#22553，29👍，2024-06 开，至今 open，多人连续独立复现） |
+| **Airflow 3** `D11` | 勾了"Run with latest bundle version"、audit log 确认勾了，**Airflow 仍然用旧代码启动任务** |
+| **Dagger** `D9` | 三条 secret 防护线不等强度：「排除出缓存键」被实证到反噬（secret 名不变则后续层一直命中缓存，token 过期后 `git clone` 一直失败） |
+| **GitLab** `D11` | 组件版本解析的"硬性前置条件"被**两个相反方向**证伪 |
+| **OpenHands** `D14` | 被引用的那一个文件确实是范本，但**不能推广到仓库里其他工作流** |
+| **Langfuse** `D12` | "只存一张 observations 表"不成立——文档自己用了"**概念上**"这个限定词，而声称把它读成了物理实现 |
+| **LiteLLM** `D4` | 告警清单与"记账失败"独立告警属实（这部分够 A 级），被推翻的是别的半句 |
+| **gh-aw** 其他 | 见上方 ① ③ |
+
+#### 一条方法论
+
+这 20 条里，**没有一条是靠读文档能发现的**——全部来自 GitHub issue（按 reactions 排序）、安全公告、HN 评论、论坛复现报告。
+
+> **对 Orrery 的直接含义**：抄任何一个机制之前，先去它的 issue 区按 reactions 排序翻前 30 条。文档写的是设计意图，issue 区写的是它实际怎么坏的。
 
 ---
 
@@ -573,7 +640,8 @@ jq -r '.evidence_grade' research/claims.jsonl | sort | uniq -c
 
 ## 附录 C · 方法的局限
 
-1. **A 级只有 6 条**（占 3%）。绝大多数能力只有厂商文档说它存在。口碑挖掘工作流因用量限制中断过一次，重跑结果未合入本版。
-2. **Forgejo Actions 一组只采到官方文档自陈的限制**，未做社区抽样。
-3. **Mentat 的后继（mentat.ai / MentatBot）本环境 DNS 解析失败**，按"未能核实"处理，未下结论。
-4. 引用一律转述，单条不超过 15 词并署名。
+1. **A 级 61 条（31%）**，B 级 105 条。B 级意味着只有厂商文档说它存在，没有可查证的用户印证——不等于假，但选型时不该当成已验证。
+2. **口碑挖掘曾因用量限制整批失败一次**（13 个 agent、93 万 token、零产出），重跑后全部完成。这暴露了一个编排缺陷：13 个 agent 共命运，一批全挂等于全废，应该拆成可独立交付的小批。
+3. **Forgejo Actions 一组只采到官方文档自陈的限制**，未做社区抽样。
+4. **Mentat 的后继（mentat.ai / MentatBot）本环境 DNS 解析失败**，按"未能核实"处理，未下结论。
+5. 引用一律转述，单条不超过 15 词并署名。

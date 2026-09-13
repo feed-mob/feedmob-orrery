@@ -81,7 +81,7 @@ Orrery 读得懂现有的 workflow 文件，但底下是我们自己的引擎。
 
 ## 竞品调研结论（2026-09-12）
 
-55 个产品、19 维、158 张优点卡、14 块墓碑。完整见 [`research/competitor-collection.md`](research/competitor-collection.md)，证据台账 [`research/claims.jsonl`](research/claims.jsonl)。
+55 个产品、19 维、158 张优点卡（**61 张 A 级**）、**20 条被用户证据推翻的文档声称**、14 块墓碑。完整见 [`research/competitor-collection.md`](research/competitor-collection.md)，证据台账 [`research/claims.jsonl`](research/claims.jsonl)。
 
 **三条改变章程的发现：**
 
@@ -90,6 +90,10 @@ Orrery 读得懂现有的 workflow 文件，但底下是我们自己的引擎。
 2. **55 个产品里只有 8 个通过 agent-first 五问**，且 durable execution / 工作流自动化 / 部署三个品类的领头羊**全部不通过**。agent 治理这一层没有现成占位者。
 
 3. **墓碑指向同一个结论**：Orrery 应是 GitHub Actions 之上的**治理与确定性层**，不是它的替代品。Earthly CI 死于迁移成本墙；Drone、Codefresh 被套件吃掉；BuildJet 被平台原生化挤死。判断标准：**如果这个功能写在 GitHub 的 roadmap 上是合理的，Orrery 就不该建它。**
+
+4. **20 条文档级声称被用户证据推翻**，其中几条正好落在原本准备抄的设计上——`LiteLLM` 的 `max_budget_per_session` **不是硬闸**（准入不预留，并发请求双双放行）、`gh-aw` 的 AI Credits 定价**会间歇性整个失败**、`Argo CD` 的 rollback 在默认 auto-sync 下**不可用**。见 [§2.5](research/competitor-collection.md)。
+
+> 方法论：这 20 条**没有一条是靠读文档能发现的**。抄任何机制之前，先去它的 issue 区按 reactions 排序翻前 30 条——文档写的是设计意图，issue 区写的是它实际怎么坏的。
 
 **新增硬约束**（来自 Airplane.dev 那块碑）：**Orrery 挂掉时，8 个仓库必须仍能用原生 GitHub Actions 部署。**
 
