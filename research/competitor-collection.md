@@ -57,7 +57,7 @@
 | **群扫** | 10 组 + 墓碑考古 = 11 | 50 个产品、80 张卡、14 块墓碑 |
 | **口碑挖掘** | 13 | 39 个产品的用户口碑块、125 条声称裁定（56 升 A / 49 维持 B / **20 条被推翻**） |
 
-**两道核验都起了作用。** 第一道（对抗核验）：：深潜阶段调研员自评给出的等级，被核验员逐条访问 URL 之后**全部降级**——78 张卡最终 58 张 B、20 张 C，**零张 A**。其中一张 Claude Managed Agents 的停止语义卡被抓到**引用错页**（`session-operations` 页根本没有它引的那段话），直接降 C。
+**两道核验都起了作用。** 第一道（对抗核验）：深潜阶段调研员自评给出的等级，被核验员逐条访问 URL 之后**全部降级**——78 张卡最终 58 张 B、20 张 C，**零张 A**。其中一张 Claude Managed Agents 的停止语义卡被抓到**引用错页**（`session-operations` 页根本没有它引的那段话），直接降 C。
 
 ### 1.2 证据等级，以及为什么 A 级这么少
 
@@ -200,8 +200,9 @@
 > ⚠ 但有个值得警惕的反例：Devin 的口径写得这么清楚，HN 上仍有人说 ACU 过于不透明——因为**口径写在文档里，不等于成本显示在 run 旁边**。Devin 的 `GET /v1/sessions` 返回的 SessionSummary 里根本没有 acu 或 cost 字段。**教训：成本必须显示在 run 记录上，不是文档里。**
 
 **★ LiteLLM** `[B·integrate]` ← **最大的一顿免费午餐**
-花费台账里 `agent_id` 和 `session_id` 是**真实建表列**（`session_id` 还有索引），成本按 agent 运行归集而非按用户归集。另有 `max_iterations` + `max_budget_per_session` 硬闸，可强制每次调用必须带 trace id。
-→ **落地**：**不要自建 run 成本表**。`run_id` 写进 `x-litellm-trace-id`（落到 `session_id` 列），agent 身份写进 `agent_id`，仓库名/部署目标写进 `request_tags`。**OQ-2「核实真实花费」就是对这张表按 `session_id` 做一次聚合查询，不需要新建任何数据管道。** `require_trace_id_on_calls_by_agent=true` 让任何不声明归属的调用一律 429。
+花费台账里 `agent_id` 和 `session_id` 是**真实建表列**（`session_id` 还有索引），成本按 agent 运行归集而非按用户归集。另有 `max_iterations` + `max_budget_per_session`，可强制每次调用必须带 trace id。
+> ⚠ **但 `max_budget_per_session` 不是硬闸**——`async_pre_call_hook` 只读已累计 spend、准入不预留，成本只在请求成功后累加，并发请求双双放行（issue #34732 至今 open）。另：`agent_id` **没有索引**。详见 §2.5。
+→ **落地**：**不要自建 run 成本表**。`run_id` 写进 `x-litellm-trace-id`（落到 `session_id` 列），agent 身份写进 `agent_id`，仓库名/部署目标写进 `request_tags`。**OQ-2「核实真实花费」就是对这张表按 `session_id` 做一次聚合查询，不需要新建任何数据管道。** `require_trace_id_on_calls_by_agent=true` 让任何不声明归属的调用一律 429。**但熔断要 Orrery 自己做。**
 `https://github.com/BerriAI/litellm/blob/main/schema.prisma` · `https://docs.litellm.ai/docs/a2a_iteration_budgets`
 
 **★ gh-aw** `[B·copy]` — AI Credits 美元化（1 AIC = $0.01），两级硬顶：单次 `max-ai-credits` 与 24 小时 `max-daily-ai-credits`；**超日预算时激活阶段直接跳过 agent job**，不是让它跑完再算账。
