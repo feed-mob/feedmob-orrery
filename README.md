@@ -121,6 +121,8 @@ printf 'GITHUB_TOKEN=%s\n' "$(gh auth token)" > secrets.env && chmod 600 secrets
 ./bin/orrery rerun <run-id> --failed --wait   # 只重跑没成功的，以及它们下游的
 ./bin/orrery logs <job-id> --attempt 1        # 上一次的日志还在
 ./bin/orrery stop <job-id>                    # 请求停止；runner 收尾后确认
+
+open http://127.0.0.1:8080/                   # 面板；用 $ORRERY_API_TOKEN 登录
 ```
 
 ```bash
