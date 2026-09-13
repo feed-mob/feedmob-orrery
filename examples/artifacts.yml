@@ -1,0 +1,44 @@
+# 产物与缓存：actions/upload-artifact / download-artifact / cache。
+# 注意版本钉在 v3：act 的产物服务端实现的是 v3 协议，v4 用的是另一套
+# Results API，目前不支持（README 里写了）。
+name: Artifacts
+
+on: [push]
+
+jobs:
+  produce:
+    name: Produce
+    runs-on: [ubuntu-latest]
+    timeout-minutes: 10
+    steps:
+      - name: Make a file
+        run: |
+          mkdir -p out
+          echo "orrery artifact $(date -u +%FT%TZ)" > out/hello.txt
+          cat out/hello.txt
+      - name: Upload it
+        uses: actions/upload-artifact@v3
+        with:
+          name: hello
+          path: out/hello.txt
+      - name: Cache something
+        uses: actions/cache@v3
+        with:
+          path: out
+          key: orrery-cache-${{ github.sha }}
+
+  consume:
+    name: Consume
+    needs: produce
+    runs-on: [ubuntu-latest]
+    timeout-minutes: 10
+    steps:
+      - name: Download it
+        uses: actions/download-artifact@v3
+        with:
+          name: hello
+      - name: Prove it came back
+        run: |
+          ls -la
+          test -f hello.txt && cat hello.txt || { echo "ARTIFACT MISSING"; exit 1; }
+          echo "ARTIFACT CROSSED THE JOB BOUNDARY"

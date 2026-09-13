@@ -38,6 +38,10 @@ type actExecutor struct {
 	// dockerHost is where container jobs run. act defaults to
 	// /var/run/docker.sock, which is wrong on every VM-backed setup.
 	dockerHost string
+	// artifacts is the pair of servers a job's own steps talk back to. nil
+	// means actions/upload-artifact and actions/cache will fail, which is
+	// better than appearing to work and storing nothing.
+	artifacts *services
 	// mountDaemonSocket bind-mounts that daemon socket into the job container.
 	// Off by default and deliberately so: a step with the daemon socket can
 	// start a privileged container on the host, which is an escape out of the
@@ -88,6 +92,18 @@ func (e *actExecutor) run(ctx context.Context, task *protocol.Task, workdir stri
 
 	hook := newActHook(logs, len(job.Steps))
 
+	repo, _ := task.Context["repository"].(string)
+	svcEnv, endJob := e.artifacts.beginJob(repo)
+	defer endJob()
+
+	env := map[string]string{}
+	for k, v := range task.Vars {
+		env[k] = v
+	}
+	for k, v := range svcEnv {
+		env[k] = v
+	}
+
 	cfg := &actrunner.Config{
 		Workdir:        workdir,
 		BindWorkdir:    false,
@@ -106,7 +122,7 @@ func (e *actExecutor) run(ctx context.Context, task *protocol.Task, workdir stri
 		// checkout is lying about what it ran.
 		NoSkipCheckout: true,
 
-		Env:     task.Vars,
+		Env:     env,
 		Secrets: task.Secrets,
 		Vars:    task.Vars,
 		Token:   gh.Token,
@@ -133,6 +149,13 @@ func (e *actExecutor) run(ctx context.Context, task *protocol.Task, workdir stri
 		ContainerMaxLifetime:  lifetime(ctx, task),
 		ContainerDaemonSocket: e.daemonSocketMount(),
 		CleanWorkdir:          true,
+
+		// A non-empty ArtifactServerPath is what makes act export
+		// ACTIONS_RUNTIME_URL and ACTIONS_RUNTIME_TOKEN at all; without it
+		// actions/upload-artifact fails on the missing token.
+		ArtifactServerPath: e.artifacts.artifactPathOr(""),
+		ArtifactServerAddr: e.artifacts.artifactAddrOr(""),
+		ArtifactServerPort: e.artifacts.artifactPortOr(""),
 	}
 
 	rr, err := actrunner.New(cfg)
@@ -254,12 +277,14 @@ func githubContext(task *protocol.Task, jobID, jobName string) *model.GithubCont
 		EventName:       orElse(get("event_name"), "push"),
 		Token:           get("token"),
 		Workflow:        get("workflow"),
-		RunID:           strconv.FormatInt(task.ID, 10),
-		RunNumber:       strconv.FormatInt(task.ID, 10),
-		Job:             jobID,
-		JobName:         jobName,
-		RetentionDays:   "0",
-		Event:           map[string]any{},
+		// Shared by every job of the run. The artifact store is keyed by run
+		// id, so a per-job value silently breaks upload/download across jobs.
+		RunID:         numeric(task.Context, "run_id", task.ID),
+		RunNumber:     numeric(task.Context, "run_number", task.ID),
+		Job:           jobID,
+		JobName:       jobName,
+		RetentionDays: "0",
+		Event:         map[string]any{},
 
 		// actions/checkout builds its clone URL from ServerURL; an empty one
 		// fails the step with a bare "Invalid URL" and no hint of the cause.
@@ -283,6 +308,28 @@ func forgeHost(serverURL string) string {
 		return "github.com"
 	}
 	return serverURL
+}
+
+// numeric reads a number out of the task context. JSON turns every number into
+// a float64 on the way across, so the obvious int64 type assertion never fires.
+func numeric(ctx map[string]any, key string, def int64) string {
+	v, ok := ctx[key]
+	if !ok {
+		return strconv.FormatInt(def, 10)
+	}
+	switch n := v.(type) {
+	case float64:
+		return strconv.FormatInt(int64(n), 10)
+	case int64:
+		return strconv.FormatInt(n, 10)
+	case int:
+		return strconv.Itoa(n)
+	case string:
+		if n != "" {
+			return n
+		}
+	}
+	return strconv.FormatInt(def, 10)
 }
 
 func owner(repo string) string {

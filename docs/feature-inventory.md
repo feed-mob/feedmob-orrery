@@ -27,9 +27,17 @@ P0 的骨架与执行器都已跑通，以下条目**已验证可用**，不再�
 | 48 | `vars` 配置变量 | 与密钥同一注入路径，`ORRERY_VAR_*` |
 | 49 | 步骤摘要与注解 | 步骤时间线（名称 / 结果 / 耗时 / 日志区间）落库并在 CLI 展示 |
 
-**下一项是 #47 状态回写**——没有它 Orrery 挂不上现有的 PR 与分支保护流程，这是对标清单里最要紧的缺口。
+| 1 36 38 | git 事件触发与过滤 | 签名校验的 GitHub webhook；`branches` / `tags` / `paths` / `types` 按 GitHub 语义过滤；按 delivery id 幂等 |
+| 27 28 | 产物与缓存 | `examples/artifacts.yml`：upload → download 跨 job 取回同一文件（**钉 v3**，act 的服务端是 v3 协议） |
+| 40 | job outputs 跨 job | `examples/outputs.yml`：`needs.build.outputs.image_tag` |
+| 47 | **状态回写** | Commit Status API，context `orrery / <workflow>`；入队 pending、落定终态 |
+| 67 | 幂等键 | webhook delivery id |
 
-**已知边界**（见 README）：`GITHUB_API_URL` 对 github.com 是错的（`gitea/runner` v1.0.8 硬编码 Gitea 的 API 形状，无配置开关）；host 模式的 job 继承 runner 进程的环境变量。
+**下一项**是 job 级 `if:`（`always()` / `failure()`）——调度器目前在上游失败时把下游一律标 skipped，
+所以"失败时通知"这类 job 不会跑。
+
+**已知边界**（见 README）：`GITHUB_API_URL` 对 github.com 是错的（`gitea/runner` v1.0.8 硬编码 Gitea 的 API 形状，无配置开关）；
+host 模式的 job 继承 runner 进程的环境变量；产物与缓存 action 必须钉 `@v3`，且属于产生它的那台 runner。
 
 ---
 

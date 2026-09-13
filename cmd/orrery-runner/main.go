@@ -39,6 +39,11 @@ func main() {
 		actionsOffline = flag.Bool("actions-offline", false, "serve only already-cached actions and refuse network fetches")
 		dockerHost     = flag.String("docker-host", os.Getenv("DOCKER_HOST"), "docker daemon for container jobs; empty probes the conventional socket paths")
 		mountSock      = flag.Bool("mount-docker-socket", false, "bind the docker daemon into every job container so steps can run `docker`; this lets a step escape its own sandbox, so leave it off unless the jobs are trusted")
+		svcAddr        = flag.String("service-addr", "", "address job containers reach the artifact and cache servers on; empty probes the host's outbound IP, which is what a container can route to")
+		artifactPort   = flag.Int("artifact-port", 34567, "port for the artifact server")
+		cachePort      = flag.Int("cache-port", 0, "port for the cache server; 0 lets the OS choose")
+		noArtifacts    = flag.Bool("no-artifacts", false, "do not run the artifact server; actions/upload-artifact then fails rather than silently storing nothing")
+		noCache        = flag.Bool("no-cache", false, "do not run the cache server; actions/cache then fails")
 		verbose        = flag.Bool("v", false, "debug logging")
 	)
 	flag.Parse()
@@ -100,6 +105,11 @@ func main() {
 		ActionsOffline:    *actionsOffline,
 		DockerHost:        *dockerHost,
 		MountDockerSocket: *mountSock,
+		ServiceAddr:       *svcAddr,
+		ArtifactPort:      *artifactPort,
+		CachePort:         *cachePort,
+		NoArtifacts:       *noArtifacts,
+		NoCache:           *noCache,
 	}, log)
 
 	if err := r.Run(ctx); err != nil {

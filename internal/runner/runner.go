@@ -37,6 +37,18 @@ type Options struct {
 	// step can run `docker`. It is an escape hatch out of the job's own
 	// sandbox, so it is off unless an operator asks for it.
 	MountDockerSocket bool
+
+	// ServiceAddr is the address job containers reach the artifact and cache
+	// servers on. Empty probes the host's outbound IP, which is what a
+	// container can route to; loopback is not.
+	ServiceAddr  string
+	ArtifactPort int
+	CachePort    int
+	// NoArtifacts and NoCache switch off the two servers. Off means
+	// actions/upload-artifact and actions/cache fail rather than no-op, so
+	// these exist for a runner whose jobs are known not to use them.
+	NoArtifacts bool
+	NoCache     bool
 }
 
 func (o *Options) withDefaults() {
@@ -55,6 +67,12 @@ func (o *Options) withDefaults() {
 	if o.DockerHost == "" {
 		o.DockerHost = ResolveDockerHost()
 	}
+	// Port 0 lets the OS choose for the cache server, which is what act does.
+	// The artifact server needs a fixed port because its URL is built from the
+	// configured value rather than from the listener.
+	if o.ArtifactPort == 0 {
+		o.ArtifactPort = 34567
+	}
 }
 
 // Version is what this runner advertises.
@@ -72,6 +90,7 @@ type Runner struct {
 	opts Options
 	log  *slog.Logger
 	exec *actExecutor
+	svc  *services
 }
 
 // New builds a runner.
@@ -102,8 +121,16 @@ func New(cl *Client, opts Options, log *slog.Logger) *Runner {
 
 // Run loops until ctx is cancelled.
 func (r *Runner) Run(ctx context.Context) error {
+	svc, err := startServices(ctx, r.opts, r.log)
+	if err != nil {
+		return err
+	}
+	r.svc = svc
+	r.exec.artifacts = svc
+	defer svc.close()
+
 	names := r.opts.Labels.Names()
-	if _, err := r.cl.Declare(ctx, &protocol.DeclareRequest{
+	if _, err = r.cl.Declare(ctx, &protocol.DeclareRequest{
 		Version: Version, Labels: names, Capabilities: Capabilities,
 	}); err != nil {
 		return fmt.Errorf("declare: %w", err)

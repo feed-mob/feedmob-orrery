@@ -353,6 +353,12 @@ func (s *Server) tryClaim(ctx context.Context, runner *store.Runner) (*protocol.
 			"workflow":   run.WorkflowName,
 			"token":      s.forgeToken(),
 
+			// Every job of a run shares these. Using the job's own id instead
+			// is what makes an artifact uploaded by one job invisible to the
+			// next: the artifact store is keyed by run.
+			"run_id":     run.ID,
+			"run_number": run.RunNumber,
+
 			"server_url":  s.cfg.Forge.URL,
 			"api_url":     s.cfg.Forge.APIURL,
 			"graphql_url": s.cfg.Forge.GraphQLURL,

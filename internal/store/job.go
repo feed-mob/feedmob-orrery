@@ -447,9 +447,9 @@ func (s *Store) RunMeta(ctx context.Context, runID int64) (*Run, error) {
 	var created string
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at,
-		       event_payload
+		       event_payload, run_number
 		FROM runs WHERE id = ?`, runID).Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile, &r.Event,
-		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created, &r.EventPayload)
+		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created, &r.EventPayload, &r.RunNumber)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

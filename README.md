@@ -144,7 +144,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **`github.event`** | ✅ 事件原文入库并注入，`${{ github.event.pull_request.number }}` 可用 |
 | **跨 job 传值**（#40） | ✅ `needs.<job>.outputs.*` 与 `needs.<job>.result` |
 | **状态回写**（#47） | ✅ Commit Status API，`orrery / <workflow>`；入队 pending、落定终态 |
-| 产物上传 / 下载、缓存 | ⛔ P1（act 自带本地服务端，协议不用重设计） |
+| **产物与缓存**（#27 #28） | ✅ runner 内置产物与缓存服务端；跨 job 传产物已验证。**必须钉 v3**，见下 |
 | job 级 `if:`（`always()` / `failure()`） | ⛔ 调度器目前把下游一律标 skipped |
 | `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
 
@@ -174,6 +174,25 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 installation token 能创建**，PAT 和 OAuth token 一律被拒。Commit Status 任何能写
 仓库的 token 都能用，分支保护的 required checks 同样认它。等 Orrery 有了自己的
 GitHub App，再升级到 Checks API 拿 diff 行内注解。
+
+### 产物与缓存
+
+runner 进程里起两个 HTTP 服务：产物服务端（默认 34567）和缓存服务端（端口由
+OS 选）。它们绑在宿主机的出站 IP 上，因为容器里的 job 要能路由到——绑 loopback
+容器就够不着。两个都可以用 `-no-artifacts` / `-no-cache` 关掉（关掉之后对应的
+action 会**失败**，而不是静默什么都不做）。
+
+两条必须知道的边界：
+
+**钉 `@v3`。** act 的产物服务端实现的是 v3 协议（`_apis/pipelines/workflows/…`），
+缓存服务端实现的是 `_apis/artifactcache`。`upload-artifact@v4` / `download-artifact@v4`
+和 `cache@v4.2+` 用的是另一套 twirp Results API，不支持。我们**有意不设**
+`ACTIONS_RESULTS_URL`——设了会把"请钉 v3"这条清晰的约束变成一个跑到一半才失败的
+action。
+
+**产物与缓存属于产生它的那台 runner。** 只有一台 runner 时这没有区别；有多台时，
+下游 job 的 `download-artifact` 只有在恰好落到同一台 runner 上才找得到上游的上传。
+中心化的产物存储是修法，在 P1。
 
 ### 两个已知缺口（不是疏忽，是已知边界）
 

@@ -55,7 +55,11 @@ CREATE TABLE IF NOT EXISTS runs (
     stopped_at    TEXT,
     -- The forge event verbatim. It becomes `github.event`, so a workflow can
     -- read fields this server has never heard of, and a run can be replayed.
-    event_payload TEXT NOT NULL DEFAULT ''
+    event_payload TEXT NOT NULL DEFAULT '',
+    -- github.run_number: a per-workflow counter, not the primary key. Workflows
+    -- put it in image tags and release names, where a number that jumps because
+    -- another workflow ran in between is a bug people chase for hours.
+    run_number    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (status);

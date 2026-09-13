@@ -57,6 +57,7 @@ func Open(path string) (*Store, error) {
 func addColumns(db *sql.DB) error {
 	for _, stmt := range []string{
 		`ALTER TABLE runs ADD COLUMN event_payload TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN run_number INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("%s: %w", stmt, err)
@@ -250,6 +251,8 @@ type Run struct {
 	// Storing it rather than a summary is what lets a workflow read fields we
 	// have never heard of, and lets a run be replayed later.
 	EventPayload string
+	// RunNumber is github.run_number: a counter per (repo, workflow file).
+	RunNumber int64
 }
 
 // Job is a stored job.
@@ -291,10 +294,11 @@ func (s *Store) CreateRun(ctx context.Context, run Run, jobs []NewJob) (int64, e
 
 	now := ts(s.now())
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO runs (repo, workflow_name, workflow_file, event, ref, sha, actor, status, created_at, event_payload)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+		INSERT INTO runs (repo, workflow_name, workflow_file, event, ref, sha, actor, status, created_at, event_payload, run_number)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?,
+		        (SELECT COUNT(*) + 1 FROM runs WHERE repo = ? AND workflow_file = ?))`,
 		run.Repo, run.WorkflowName, run.WorkflowFile, run.Event, run.Ref, run.SHA, run.Actor, now,
-		run.EventPayload)
+		run.EventPayload, run.Repo, run.WorkflowFile)
 	if err != nil {
 		return 0, fmt.Errorf("insert run: %w", err)
 	}
