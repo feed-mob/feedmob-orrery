@@ -1,0 +1,31 @@
+# 跨 job 传值：GitHub Actions 的 `needs.<job>.outputs`。
+# build 算出一个镜像 tag，deploy 在另一台机器上把它读回来。
+name: Outputs
+
+on: [push]
+
+jobs:
+  build:
+    name: Build
+    runs-on: [self-hosted]
+    outputs:
+      image_tag: ${{ steps.tag.outputs.value }}
+      built_by: orrery
+    steps:
+      - name: Compute the tag
+        id: tag
+        run: echo "value=v1.2.3-$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: [self-hosted]
+    steps:
+      - name: Use the upstream output
+        run: |
+          echo "image_tag = ${{ needs.build.outputs.image_tag }}"
+          echo "built_by  = ${{ needs.build.outputs.built_by }}"
+          echo "result    = ${{ needs.build.result }}"
+          test -n "${{ needs.build.outputs.image_tag }}" \
+            && echo "OUTPUT CROSSED THE JOB BOUNDARY" \
+            || { echo "OUTPUT WAS EMPTY"; exit 1; }

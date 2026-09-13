@@ -242,6 +242,12 @@ func (wf *Workflow) UsedActions() []string {
 // round-tripping through it would silently drop `strategy`, `container`,
 // `services`, `defaults` and anything else act understands but we do not. The
 // runner must receive the author's YAML, not our summary of it.
+//
+// `needs:` survives the trim even though the upstream jobs do not. It is how
+// the executor knows which upstreams to graft back in from the task's own needs
+// data, which is where `needs.<job>.outputs` comes from — dropping the key here
+// would leave those expressions silently unresolvable, and a deploy job would
+// get an empty image tag rather than an error.
 func (wf *Workflow) JobPayload(source []byte, key string) ([]byte, error) {
 	if _, ok := wf.Jobs[key]; !ok {
 		return nil, fmt.Errorf("no such job %q", key)
@@ -264,7 +270,7 @@ func (wf *Workflow) JobPayload(source []byte, key string) ([]byte, error) {
 			if jobs.Content[j].Value != key {
 				continue
 			}
-			trimmed.Content = append(trimmed.Content, jobs.Content[j], stripNeeds(jobs.Content[j+1]))
+			trimmed.Content = append(trimmed.Content, jobs.Content[j], jobs.Content[j+1])
 		}
 		if len(trimmed.Content) == 0 {
 			return nil, fmt.Errorf("job %q vanished while trimming", key)
@@ -273,24 +279,4 @@ func (wf *Workflow) JobPayload(source []byte, key string) ([]byte, error) {
 		return yaml.Marshal(&doc)
 	}
 	return nil, fmt.Errorf("workflow has no jobs mapping")
-}
-
-// stripNeeds removes `needs:` from the job we send.
-//
-// The dependency graph is the server's business: it has already held this job
-// until its upstreams settled, and it passes their outputs down in the needs
-// context. Leaving `needs:` in the payload would make act look for sibling jobs
-// that are not in the file and refuse to plan.
-func stripNeeds(job *yaml.Node) *yaml.Node {
-	if job.Kind != yaml.MappingNode {
-		return job
-	}
-	out := &yaml.Node{Kind: yaml.MappingNode, Tag: job.Tag, Style: job.Style}
-	for i := 0; i+1 < len(job.Content); i += 2 {
-		if job.Content[i].Value == "needs" {
-			continue
-		}
-		out.Content = append(out.Content, job.Content[i], job.Content[i+1])
-	}
-	return out
 }

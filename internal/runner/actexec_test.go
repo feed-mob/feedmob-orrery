@@ -2,8 +2,11 @@ package runner
 
 import (
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
+
+	"gitea.com/gitea/runner/act/model"
 
 	"github.com/sirupsen/logrus"
 
@@ -165,5 +168,50 @@ func TestMarkCancelledOnlyTouchesWhatTheStopInterrupted(t *testing.T) {
 		if got[i].Result != want[i] {
 			t.Errorf("step %q = %q, want %q", got[i].Name, got[i].Result, want[i])
 		}
+	}
+}
+
+// `needs.<job>.outputs.<key>` is read straight off act's workflow model. The
+// upstreams ran on another machine and are not in the payload, so without the
+// stubs a deploy job gets an empty image tag instead of an error.
+func TestGraftNeedsStubsUpstreamJobs(t *testing.T) {
+	src := `
+name: Outputs
+on: [push]
+jobs:
+  deploy:
+    needs: [build, sign]
+    runs-on: [self-hosted]
+    steps:
+      - run: echo ${{ needs.build.outputs.image_tag }}
+`
+	wf, err := model.ReadWorkflow(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("read workflow: %v", err)
+	}
+	_, job := firstJob(wf)
+	graftNeeds(wf, job, map[string]protocol.TaskNeed{
+		"build": {Outputs: map[string]string{"image_tag": "v1.2.3"}, Result: protocol.ResultSuccess},
+		// `sign` reports nothing: the scheduler only dispatches when upstreams
+		// succeeded, so silence has to read as success rather than as "".
+		"sign": {},
+	})
+
+	build := wf.GetJob("build")
+	if build == nil || build.Outputs["image_tag"] != "v1.2.3" || build.Result != "success" {
+		t.Fatalf("build stub = %+v", build)
+	}
+	if sign := wf.GetJob("sign"); sign == nil || sign.Result != "success" {
+		t.Fatalf("sign stub = %+v", sign)
+	}
+	// A stub must have no steps: act treats a step-less job as a no-op, which
+	// is what stops the graft from re-running work that happened elsewhere.
+	if len(build.Steps) != 0 {
+		t.Errorf("stub carries %d steps; it would re-run the upstream", len(build.Steps))
+	}
+	// Planning must succeed — the whole reason `needs:` used to be stripped was
+	// that act refuses to plan a job whose upstreams are missing.
+	if _, err := model.CombineWorkflowPlanner(wf).PlanJob("deploy"); err != nil {
+		t.Fatalf("plan with stubs: %v", err)
 	}
 }

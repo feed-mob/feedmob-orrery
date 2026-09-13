@@ -17,6 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/feed-mob/feedmob-orrery/internal/protocol"
+	"go.yaml.in/yaml/v4"
 )
 
 // actExecutor runs a task through act, which is where `uses:` steps, container
@@ -65,6 +66,8 @@ func (e *actExecutor) run(ctx context.Context, task *protocol.Task, workdir stri
 	if job == nil {
 		return nil, fmt.Errorf("workflow payload carries no job")
 	}
+	graftNeeds(wf, job, task.Needs)
+
 	plan, err := model.CombineWorkflowPlanner(wf).PlanJob(jobID)
 	if err != nil {
 		return nil, fmt.Errorf("plan job %s: %w", jobID, err)
@@ -178,6 +181,44 @@ func lifetime(ctx context.Context, task *protocol.Task) time.Duration {
 		return time.Duration(task.TimeoutMinutes) * time.Minute
 	}
 	return time.Hour
+}
+
+// graftNeeds puts the upstream jobs back into the workflow model as stubs
+// carrying nothing but their outputs and result.
+//
+// `needs.<job>.outputs.<key>` is read straight off the workflow model, so a
+// payload holding one job has nowhere for those values to come from — the
+// expression resolves to nothing and a deploy job silently gets an empty image
+// tag. The upstreams ran on some other machine; what crosses the wire is the
+// task's needs data, and this is where it re-enters act's world.
+//
+// A stub has no steps, and act treats a job with no steps as a no-op: it never
+// starts a container and never touches the stub's result. That is what keeps
+// grafting them in from re-running work that already happened elsewhere.
+func graftNeeds(wf *model.Workflow, job *model.Job, needs map[string]protocol.TaskNeed) {
+	for _, id := range job.Needs() {
+		if _, ok := wf.Jobs[id]; ok {
+			continue
+		}
+		need := needs[id]
+		result := string(need.Result)
+		if result == "" {
+			// The scheduler only dispatches a job whose upstreams succeeded, so
+			// silence here means success. This assumption is load-bearing and
+			// has to be revisited alongside `if: always()` / `if: failure()`,
+			// which are the cases where a job runs after an upstream did not
+			// succeed — act's handleFailure reads these stub results back.
+			result = string(protocol.ResultSuccess)
+		}
+		wf.Jobs[id] = &model.Job{
+			Outputs: need.Outputs,
+			Result:  result,
+			// A stub never runs, but act warns about a job with no `runs-on`
+			// while planning, and that warning lands in the downstream job's
+			// log where it reads as a problem with the job that is running.
+			RawRunsOn: yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: HostPlatform},
+		}
+	}
 }
 
 func firstJob(wf *model.Workflow) (string, *model.Job) {

@@ -176,10 +176,10 @@ jobs:
 			t.Errorf("payload dropped %q, which this parser does not model", want)
 		}
 	}
-	// needs is the server's business and act would look for a job that is no
-	// longer in the file.
-	if strings.Contains(out, "needs") {
-		t.Error("payload still carries needs:")
+	// needs must survive: it is how the runner knows which upstream stubs to
+	// graft back in, and `needs.build.outputs.*` is read off that graph.
+	if !strings.Contains(out, "needs") {
+		t.Error("payload dropped needs:, leaving needs.<job>.outputs unresolvable")
 	}
 }
 
