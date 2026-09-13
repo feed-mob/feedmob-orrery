@@ -49,6 +49,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	if err := rebuildForAttempts(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{db: db, now: time.Now}, nil
 }
 
@@ -67,12 +71,100 @@ func addColumns(db *sql.DB) error {
 		`ALTER TABLE runs ADD COLUMN run_number INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE runs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE runs ADD COLUMN cancel_in_progress INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN run_attempt INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("%s: %w", stmt, err)
 		}
 	}
 	return nil
+}
+
+// rebuildForAttempts widens job_logs and job_steps to be keyed by attempt.
+//
+// The schema is CREATE TABLE IF NOT EXISTS, and SQLite cannot alter a primary
+// key, so a database made by an earlier build would keep the two-column key and
+// silently refuse the second attempt's rows. Rebuilding is the only way to make
+// a migrated database identical to a fresh one, and two databases with the same
+// version and different shapes is the kind of difference that surfaces months
+// later as "it works on mine".
+func rebuildForAttempts(db *sql.DB) error {
+	for _, t := range []struct {
+		name, create, columns string
+	}{
+		{
+			name: "job_logs",
+			create: `CREATE TABLE job_logs_new (
+				job_id  INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+				attempt INTEGER NOT NULL DEFAULT 1,
+				idx     INTEGER NOT NULL,
+				ts      TEXT    NOT NULL,
+				content TEXT    NOT NULL,
+				PRIMARY KEY (job_id, attempt, idx)
+			)`,
+			columns: "job_id, idx, ts, content",
+		},
+		{
+			name: "job_steps",
+			create: `CREATE TABLE job_steps_new (
+				job_id     INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+				attempt    INTEGER NOT NULL DEFAULT 1,
+				step_index INTEGER NOT NULL,
+				name       TEXT    NOT NULL DEFAULT '',
+				result     TEXT    NOT NULL DEFAULT '',
+				started_at TEXT,
+				stopped_at TEXT,
+				log_index  INTEGER NOT NULL DEFAULT 0,
+				log_length INTEGER NOT NULL DEFAULT 0,
+				PRIMARY KEY (job_id, attempt, step_index)
+			)`,
+			columns: "job_id, step_index, name, result, started_at, stopped_at, log_index, log_length",
+		},
+	} {
+		keyed, err := attemptIsInKey(db, t.name)
+		if err != nil {
+			return err
+		}
+		if keyed {
+			continue
+		}
+		stmts := []string{
+			t.create,
+			fmt.Sprintf("INSERT INTO %s_new (%s) SELECT %s FROM %s", t.name, t.columns, t.columns, t.name),
+			fmt.Sprintf("DROP TABLE %s", t.name),
+			fmt.Sprintf("ALTER TABLE %s_new RENAME TO %s", t.name, t.name),
+		}
+		for _, stmt := range stmts {
+			if _, err := db.Exec(stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+	}
+	return nil
+}
+
+// attemptIsInKey reports whether the table's primary key already includes the
+// attempt column.
+func attemptIsInKey(db *sql.DB, table string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == "attempt" && pk > 0 {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // ClaimDelivery records a webhook delivery and reports whether it is new.
@@ -262,6 +354,8 @@ type Run struct {
 	EventPayload string
 	// RunNumber is github.run_number: a counter per (repo, workflow file).
 	RunNumber int64
+	// RunAttempt is github.run_attempt: 1 the first time, bumped by a re-run.
+	RunAttempt int64
 	// ConcurrencyGroup serialises runs that share it; empty means no limit.
 	ConcurrencyGroup string
 	// CancelInProgress throws away the run already going instead of queueing

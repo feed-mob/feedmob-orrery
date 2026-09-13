@@ -311,7 +311,7 @@ func TestAppendLogsIsIdempotentAndRefusesGaps(t *testing.T) {
 	if ack, err = st.AppendLogs(ctx, id, 0, rows, false); err != nil || ack != 2 {
 		t.Fatalf("retry ack = %d (%v), want 2", ack, err)
 	}
-	lines, _ := st.Logs(ctx, id)
+	lines, _ := st.Logs(ctx, id, nil)
 	if len(lines) != 2 {
 		t.Fatalf("stored %d lines after a retry, want 2", len(lines))
 	}
@@ -324,7 +324,7 @@ func TestAppendLogsIsIdempotentAndRefusesGaps(t *testing.T) {
 	if ack != 2 {
 		t.Fatalf("ack after a gap = %d, want the unchanged 2", ack)
 	}
-	if lines, _ = st.Logs(ctx, id); len(lines) != 2 {
+	if lines, _ = st.Logs(ctx, id, nil); len(lines) != 2 {
 		t.Fatalf("a gapped window was stored anyway: %d lines", len(lines))
 	}
 }

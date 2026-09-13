@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS runs (
     -- put it in image tags and release names, where a number that jumps because
     -- another workflow ran in between is a bug people chase for hours.
     run_number    INTEGER NOT NULL DEFAULT 0,
+    -- github.run_attempt. Re-running keeps the run and bumps this, so the
+    -- artifacts and outputs of the jobs that passed are still there for the
+    -- jobs being re-run — which is the whole point of a partial re-run.
+    run_attempt   INTEGER NOT NULL DEFAULT 1,
     -- Runs sharing a group run one at a time. status 'pending' means the run is
     -- waiting for its group, and is the reason ClaimJob joins back to runs:
     -- a pending run's jobs are queued but must not be handed out.
@@ -95,6 +99,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     force_terminated  INTEGER NOT NULL DEFAULT 0,
     cleanup_ran       INTEGER NOT NULL DEFAULT 0,
 
+    -- Which re-run this is. Logs and steps are keyed by it, so re-running a
+    -- failed job does not overwrite the evidence of the failure you re-ran —
+    -- which is exactly the moment you want to keep looking at it.
+    attempt INTEGER NOT NULL DEFAULT 1,
+
     UNIQUE (run_id, job_key)
 );
 
@@ -110,6 +119,7 @@ CREATE TABLE IF NOT EXISTS job_outputs (
 
 CREATE TABLE IF NOT EXISTS job_steps (
     job_id     INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+    attempt    INTEGER NOT NULL DEFAULT 1,
     step_index INTEGER NOT NULL,
     name       TEXT    NOT NULL DEFAULT '',
     result     TEXT    NOT NULL DEFAULT '',
@@ -117,7 +127,7 @@ CREATE TABLE IF NOT EXISTS job_steps (
     stopped_at TEXT,
     log_index  INTEGER NOT NULL DEFAULT 0,
     log_length INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (job_id, step_index)
+    PRIMARY KEY (job_id, attempt, step_index)
 );
 
 -- Logs are one append-only stream per job; steps index into it via
@@ -125,10 +135,11 @@ CREATE TABLE IF NOT EXISTS job_steps (
 -- runner's reply, not by the HTTP status of the submission.
 CREATE TABLE IF NOT EXISTS job_logs (
     job_id  INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL DEFAULT 1,
     idx     INTEGER NOT NULL,
     ts      TEXT    NOT NULL,
     content TEXT    NOT NULL,
-    PRIMARY KEY (job_id, idx)
+    PRIMARY KEY (job_id, attempt, idx)
 );
 
 CREATE TABLE IF NOT EXISTS job_log_state (

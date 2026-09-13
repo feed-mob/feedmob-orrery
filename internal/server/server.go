@@ -156,6 +156,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/runs", s.handleSubmitRun)
 	s.mux.HandleFunc("GET /api/runs", s.handleListRuns)
 	s.mux.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
+	s.mux.HandleFunc("POST /api/runs/{id}/rerun", s.handleRerun)
 	s.mux.HandleFunc("GET /api/jobs/{id}/logs", s.handleJobLogs)
 	s.mux.HandleFunc("POST /api/jobs/{id}/stop", s.handleStopJob)
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -372,8 +373,9 @@ func (s *Server) tryClaim(ctx context.Context, runner *store.Runner) (*protocol.
 			// Every job of a run shares these. Using the job's own id instead
 			// is what makes an artifact uploaded by one job invisible to the
 			// next: the artifact store is keyed by run.
-			"run_id":     run.ID,
-			"run_number": run.RunNumber,
+			"run_id":      run.ID,
+			"run_number":  run.RunNumber,
+			"run_attempt": run.RunAttempt,
 
 			"server_url":  s.cfg.Forge.URL,
 			"api_url":     s.cfg.Forge.APIURL,
@@ -617,13 +619,52 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sum)
 }
 
+// handleRerun starts a finished run over. ?failed_only=true re-runs only what
+// did not succeed, plus everything downstream of it.
+func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad run id")
+		return
+	}
+	failedOnly := r.URL.Query().Get("failed_only") == "true"
+	n, err := s.st.Rerun(r.Context(), id, failedOnly)
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "no such run")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	s.wake.broadcast()
+
+	run, err := s.st.RunMeta(r.Context(), id)
+	if err == nil {
+		s.reportStatus(run, forge.StatePending, fmt.Sprintf("re-running %d job(s)", n))
+	}
+	s.log.Info("run re-queued", "run", id, "jobs", n, "failed_only", failedOnly)
+	writeJSON(w, http.StatusOK, map[string]any{"run_id": id, "jobs": n})
+}
+
 func (s *Server) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad job id")
 		return
 	}
-	lines, err := s.st.Logs(r.Context(), id)
+	// ?attempt=N reads an earlier run of this job. The default is the current
+	// attempt, so the common case needs no query string.
+	var attempt *int
+	if v := r.URL.Query().Get("attempt"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			writeErr(w, http.StatusBadRequest, "attempt must be a positive integer")
+			return
+		}
+		attempt = &n
+	}
+	lines, err := s.st.Logs(r.Context(), id, attempt)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

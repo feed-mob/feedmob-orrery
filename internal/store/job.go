@@ -96,13 +96,14 @@ func (s *Store) SetSteps(ctx context.Context, jobID int64, steps []StepReport) e
 			stopped = ts(*st.StoppedAt)
 		}
 		if _, err := s.db.ExecContext(ctx, `
-			INSERT INTO job_steps (job_id, step_index, name, result, started_at, stopped_at, log_index, log_length)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (job_id, step_index) DO UPDATE SET
+			INSERT INTO job_steps (job_id, attempt, step_index, name, result, started_at, stopped_at,
+			                       log_index, log_length)
+			VALUES (?, (SELECT attempt FROM jobs WHERE id = ?), ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (job_id, attempt, step_index) DO UPDATE SET
 				name = excluded.name, result = excluded.result,
 				started_at = excluded.started_at, stopped_at = excluded.stopped_at,
 				log_index = excluded.log_index, log_length = excluded.log_length`,
-			jobID, st.Index, st.Name, st.Result, started, stopped, st.LogIndex, st.LogLength); err != nil {
+			jobID, jobID, st.Index, st.Name, st.Result, started, stopped, st.LogIndex, st.LogLength); err != nil {
 			return err
 		}
 	}
@@ -369,8 +370,10 @@ func (s *Store) AppendLogs(ctx context.Context, jobID, index int64, rows []LogLi
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO job_logs (job_id, idx, ts, content) VALUES (?, ?, ?, ?)
-			ON CONFLICT (job_id, idx) DO NOTHING`, jobID, at, ts(row.Time), row.Content); err != nil {
+			INSERT INTO job_logs (job_id, attempt, idx, ts, content)
+			VALUES (?, (SELECT attempt FROM jobs WHERE id = ?), ?, ?, ?)
+			ON CONFLICT (job_id, attempt, idx) DO NOTHING`,
+			jobID, jobID, at, ts(row.Time), row.Content); err != nil {
 			return 0, err
 		}
 		ack = at + 1
@@ -393,8 +396,14 @@ type LogLine struct {
 }
 
 // Logs returns a job's stored log lines in order.
-func (s *Store) Logs(ctx context.Context, jobID int64) ([]LogLine, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT ts, content FROM job_logs WHERE job_id = ? ORDER BY idx ASC`, jobID)
+//
+// attempt nil means the current one. Passing an older attempt is how the log of
+// a failure survives the re-run that was meant to fix it.
+func (s *Store) Logs(ctx context.Context, jobID int64, attempt *int) ([]LogLine, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT ts, content FROM job_logs
+		WHERE job_id = ? AND attempt = COALESCE(?, (SELECT attempt FROM jobs WHERE id = ?))
+		ORDER BY idx ASC`, jobID, attempt, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -473,9 +482,10 @@ func (s *Store) RunMeta(ctx context.Context, runID int64) (*Run, error) {
 	var created string
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at,
-		       event_payload, run_number
+		       event_payload, run_number, run_attempt
 		FROM runs WHERE id = ?`, runID).Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile, &r.Event,
-		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created, &r.EventPayload, &r.RunNumber)
+		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created, &r.EventPayload, &r.RunNumber,
+		&r.RunAttempt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -517,9 +527,11 @@ func (s *Store) RunByID(ctx context.Context, id int64) (*RunSummary, error) {
 	var r Run
 	var created string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at
+		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at,
+		       run_number, run_attempt, concurrency_group
 		FROM runs WHERE id = ?`, id).Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile, &r.Event,
-		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created)
+		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created,
+		&r.RunNumber, &r.RunAttempt, &r.ConcurrencyGroup)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -564,7 +576,9 @@ func (s *Store) RunByID(ctx context.Context, id int64) (*RunSummary, error) {
 func (s *Store) StepsOf(ctx context.Context, jobID int64) ([]StepReport, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT step_index, name, result, started_at, stopped_at, log_index, log_length
-		FROM job_steps WHERE job_id = ? ORDER BY step_index ASC`, jobID)
+		FROM job_steps
+		WHERE job_id = ? AND attempt = (SELECT attempt FROM jobs WHERE id = ?)
+		ORDER BY step_index ASC`, jobID, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -643,10 +657,10 @@ func runInTx(ctx context.Context, tx *sql.Tx, runID int64) (*Run, error) {
 	var r Run
 	err := tx.QueryRowContext(ctx, `
 		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result,
-		       event_payload, run_number, concurrency_group
+		       event_payload, run_number, concurrency_group, run_attempt
 		FROM runs WHERE id = ?`, runID).Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile,
 		&r.Event, &r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &r.EventPayload, &r.RunNumber,
-		&r.ConcurrencyGroup)
+		&r.ConcurrencyGroup, &r.RunAttempt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

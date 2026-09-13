@@ -117,6 +117,8 @@ printf 'GITHUB_TOKEN=%s\n' "$(gh auth token)" > secrets.env && chmod 600 secrets
 ./bin/orrery runs
 ./bin/orrery run <run-id>                     # 含每一步的结果、耗时与日志区间
 ./bin/orrery logs <job-id>
+./bin/orrery rerun <run-id> --failed --wait   # 只重跑没成功的，以及它们下游的
+./bin/orrery logs <job-id> --attempt 1        # 上一次的日志还在
 ./bin/orrery stop <job-id>                    # 请求停止；runner 收尾后确认
 ```
 
@@ -155,6 +157,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **状态回写**（#47） | ✅ Commit Status API，`orrery / <workflow>`；入队 pending、落定终态 |
 | **产物与缓存**（#27 #28） | ✅ runner 内置产物与缓存服务端；跨 job 传产物已验证。**必须钉 v3**，见下 |
 | **job 级 `if:`** | ✅ `always()` / `failure()` / `cancelled()` 与任意表达式，用 act 自己的解释器求值 |
+| **重跑**（#53） | ✅ `rerun [--failed]`：run 保持不变、attempt +1；成功 job 的产物与 outputs 留着给被重跑的用 |
 | `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
 
 ### 接到 GitHub 上
@@ -188,6 +191,17 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 installation token 能创建**，PAT 和 OAuth token 一律被拒。Commit Status 任何能写
 仓库的 token 都能用，分支保护的 required checks 同样认它。等 Orrery 有了自己的
 GitHub App，再升级到 Checks API 拿 diff 行内注解。
+
+### 重跑
+
+`orrery rerun <run-id> [--failed]`。按 GitHub 的模型来：**run 保持同一个 id，attempt +1**，
+而不是新建一个 run。这不是细节——只有这样，被重跑的 job 才还能拿到那些成功 job 的
+产物和 outputs。新建 run 的话，一个"只重跑 deploy"会去找一个 build 已经不打算再产出的产物。
+
+`--failed` 重跑没成功的 job **以及它们下游的全部**——下游必须跟着重跑，它的输入马上要变了。
+
+日志和步骤按 attempt 归档，**重跑不会覆盖掉你正要看的那次失败**：`orrery logs <job> --attempt 1`。
+这是"只增不改"那条原则在这里的落点。
 
 ### 并发组：默认开启
 

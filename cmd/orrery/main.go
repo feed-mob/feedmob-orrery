@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,7 +22,8 @@ usage:
   orrery dispatch <repo> <workflow-file> [--ref REF] [--input k=v ...] [--wait]
   orrery runs [--limit N]
   orrery run <id>
-  orrery logs <job-id>
+  orrery rerun <run-id> [--failed] [--wait]
+  orrery logs <job-id> [--attempt N]
   orrery stop <job-id>
 
 env:
@@ -45,6 +47,8 @@ func main() {
 		err = listRuns(base, os.Args[2:])
 	case "run":
 		err = showRun(base, os.Args[2:])
+	case "rerun":
+		err = rerun(base, os.Args[2:])
 	case "logs":
 		err = showLogs(base, os.Args[2:])
 	case "stop":
@@ -121,6 +125,33 @@ func submit(base string, args []string) error {
 		return err
 	}
 	fmt.Printf("run %d queued — %d job(s): %s\n", out.RunID, len(out.Jobs), strings.Join(out.Jobs, ", "))
+	if !hasFlag(args, "wait") {
+		return nil
+	}
+	return waitForRun(base, out.RunID)
+}
+
+// rerun starts a finished run over without a new commit.
+func rerun(base string, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: orrery rerun <run-id> [--failed]")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("bad run id %q", args[0])
+	}
+	url := fmt.Sprintf("%s/api/runs/%d/rerun", base, id)
+	if hasFlag(args, "failed") {
+		url += "?failed_only=true"
+	}
+	var out struct {
+		RunID int64 `json:"run_id"`
+		Jobs  int   `json:"jobs"`
+	}
+	if err := post(url, map[string]any{}, &out); err != nil {
+		return err
+	}
+	fmt.Printf("run %d re-queued — %d job(s)\n", out.RunID, out.Jobs)
 	if !hasFlag(args, "wait") {
 		return nil
 	}
@@ -253,6 +284,7 @@ type runSummary struct {
 		Event        string `json:"Event"`
 		Status       string `json:"Status"`
 		Result       string `json:"Result"`
+		RunAttempt   int64  `json:"RunAttempt"`
 	} `json:"Run"`
 	Jobs []struct {
 		ID              int64  `json:"ID"`
@@ -313,7 +345,12 @@ func showRun(base string, args []string) error {
 }
 
 func printRun(sum *runSummary) {
-	fmt.Printf("run %d  %s  [%s]  %s\n", sum.Run.ID, sum.Run.WorkflowName, sum.Run.Status, sum.Run.Result)
+	attempt := ""
+	if sum.Run.RunAttempt > 1 {
+		attempt = fmt.Sprintf("  attempt %d", sum.Run.RunAttempt)
+	}
+	fmt.Printf("run %d  %s  [%s]  %s%s\n",
+		sum.Run.ID, sum.Run.WorkflowName, sum.Run.Status, sum.Run.Result, attempt)
 	fmt.Printf("%-8s %-18s %-10s %-10s %-8s %s\n", "JOB", "KEY", "STATUS", "RESULT", "TIMEOUT", "NOTE")
 	for _, j := range sum.Jobs {
 		note := j.StopReason
@@ -355,7 +392,11 @@ func showLogs(base string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: orrery logs <job-id>")
 	}
-	res, err := http.Get(base + "/api/jobs/" + args[0] + "/logs")
+	url := base + "/api/jobs/" + args[0] + "/logs"
+	if a := flagValue(args, "attempt", ""); a != "" {
+		url += "?attempt=" + a
+	}
+	res, err := http.Get(url)
 	if err != nil {
 		return err
 	}

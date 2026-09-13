@@ -281,6 +281,7 @@ func githubContext(task *protocol.Task, jobID, jobName string) *model.GithubCont
 		// id, so a per-job value silently breaks upload/download across jobs.
 		RunID:         numeric(task.Context, "run_id", task.ID),
 		RunNumber:     numeric(task.Context, "run_number", task.ID),
+		RunAttempt:    numeric(task.Context, "run_attempt", 1),
 		Job:           jobID,
 		JobName:       jobName,
 		RetentionDays: "0",
