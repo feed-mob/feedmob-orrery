@@ -336,3 +336,72 @@ func TestAppendLogsStopsAtTheCap(t *testing.T) {
 		t.Errorf("got %d truncation notices, want 1", notices)
 	}
 }
+
+// Without retention the database only grows: a repository building twenty times
+// a day keeps every log line of every run forever, and the first anyone hears
+// about it is a full disk on the control plane.
+func TestPruneDropsOldFinishedRunsAndTheirLogs(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := newRunner(t, st, []string{"self-hosted"}, nil)
+
+	mk := func() int64 {
+		id, err := st.CreateRun(ctx, Run{Repo: "r", WorkflowName: "w"},
+			[]NewJob{{Key: "a", Payload: "p", RunsOn: []string{"self-hosted"}}})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		return id
+	}
+	oldRun := mk()
+	job, err := st.ClaimJob(ctx, r)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := st.AppendLogs(ctx, job.ID, 0,
+		[]LogLine{{Time: st.now(), Content: "ancient history"}}, true); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if _, err := st.FinishJob(ctx, job.ID, "success"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	// Backdate it past the window.
+	if _, err := st.db.ExecContext(ctx, `UPDATE runs SET stopped_at = ? WHERE id = ?`,
+		ts(time.Now().UTC().Add(-60*24*time.Hour)), oldRun); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	freshRun := mk()
+
+	n, err := st.Prune(ctx, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned %d runs, want 1", n)
+	}
+	if _, err := st.RunByID(ctx, oldRun); !errors.Is(err, ErrNotFound) {
+		t.Errorf("the old run survived: %v", err)
+	}
+	// A queued run older than the window is not old, it is stuck, and deleting
+	// it would hide that.
+	if _, err := st.RunByID(ctx, freshRun); err != nil {
+		t.Errorf("a run that has not finished was pruned: %v", err)
+	}
+	// The logs went with it, through the cascade rather than a hand-rolled walk
+	// that would eventually forget a table.
+	var logs int
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM job_logs WHERE job_id = ?`, job.ID).Scan(&logs); err != nil {
+		t.Fatalf("count logs: %v", err)
+	}
+	if logs != 0 {
+		t.Errorf("%d log rows outlived their run", logs)
+	}
+}
+
+func TestPruneWithNoWindowKeepsEverything(t *testing.T) {
+	st := testStore(t)
+	if n, err := st.Prune(context.Background(), 0); err != nil || n != 0 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+}

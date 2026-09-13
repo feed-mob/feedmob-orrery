@@ -67,6 +67,10 @@ type Config struct {
 	// otherwise, because an open port here is arbitrary code execution with
 	// this server's secrets attached.
 	APIToken string
+	// Retention is how long a finished run is kept. Zero keeps everything,
+	// which is the wrong default for anything long-lived: a repository
+	// building twenty times a day keeps every log line forever.
+	Retention time.Duration
 	// Repos limits which repositories this server will build. Empty means all.
 	Repos []string
 	// NotifyWebhook receives a message when a workflow's verdict changes.

@@ -37,6 +37,8 @@ func main() {
 			"token every human-facing API call and the dashboard must present")
 		noAuth = flag.Bool("insecure-no-auth", false,
 			"serve the API and dashboard with no authentication; anyone who can reach the port can run arbitrary workflows with this server's secrets")
+		retention = flag.Duration("retention", 30*24*time.Hour,
+			"how long a finished run and its logs are kept; 0 keeps everything")
 		repos = flag.String("repos", os.Getenv("ORRERY_REPOS"),
 			"comma-separated owner/repo this server will build; empty means any repository a signed webhook names")
 		notifyHook = flag.String("notify-webhook", os.Getenv("ORRERY_NOTIFY_WEBHOOK"),
@@ -110,6 +112,7 @@ func main() {
 		NotifyWebhook:      *notifyHook,
 		APIToken:           *apiToken,
 		Repos:              splitList(*repos),
+		Retention:          *retention,
 	}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -117,6 +120,7 @@ func main() {
 
 	go srv.RunReaper(ctx)
 	go srv.RunScheduler(ctx)
+	go srv.RunPruner(ctx)
 
 	hs := &http.Server{
 		Addr:              *addr,
@@ -137,6 +141,7 @@ func main() {
 		"stop_grace", *grace, "forge", *forgeURL,
 		"forge_token", *forgeToken != "", "webhooks", *hookSecret != "",
 		"default_concurrency", *defaultConc, "notify", *notifyHook != "",
+		"retention", *retention,
 		"auth", *apiToken != "",
 		"secrets", keysOf(secrets))
 	log.Info("dashboard", "url", orDefault(*publicURL, "http://"+strings.TrimPrefix(*addr, ":")+"/"))

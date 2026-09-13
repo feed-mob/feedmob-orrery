@@ -216,6 +216,31 @@ localStorage 里的东西页面上任何脚本都读得到，而这个令牌能�
 **这还不是身份系统。** 一个共享令牌没有"谁"的概念，也就没法做 RBAC（#73）。
 它关掉的是"任何能连到端口的人"，不是"团队里的谁能做什么"。
 
+### 部署成服务
+
+`deploy/` 里有两份 systemd unit 和两份环境变量模板：
+
+```bash
+install -m 0755 bin/orrery-server bin/orrery-runner /usr/local/bin/
+install -d -m 0700 /etc/orrery
+install -m 0600 deploy/orrery-server.env /etc/orrery/server.env    # 填上你自己的值
+install -m 0644 deploy/orrery-server.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now orrery-server
+```
+
+密钥走 `EnvironmentFile` 而不是命令行——**命令行任何人一个 `ps` 就看到了**。
+
+控制面那份 unit 收得很紧（`ProtectSystem=strict`、`SystemCallFilter=@system-service`
+等等），因为它不执行任何用户代码。**runner 那份有意不收**：workflow 本来就要写工作
+目录、起容器、监听产物与缓存服务端的端口，把这些挡掉只会把"看起来收紧了"和"真的
+收紧了"混为一谈。runner 的隔离边界是**这台机器本身**——它必须是一台不承载应用和
+数据库的独立主机。
+
+**保留期**：`-retention` 默认 30 天，过期的已完成 run 连同它的日志一起删掉。
+留 0 等于全留——对一个长期跑的服务这是错的默认：一个一天构建二十次的仓库会把每一
+行日志永远留着，而第一个发现的人通常是磁盘满了才发现。还在排队的 run 不会被删：
+一个超过窗口还没跑的 run 不是旧，是卡住了，删掉等于把它藏起来。
+
 ### 接到 GitHub 上
 
 ```bash
@@ -334,7 +359,7 @@ Gitea 的 API 形状（`<forge>/api/v1`，且把 `GITHUB_GRAPHQL_URL` 置空）�
 修它意味着把 act 那棵树接管过来自己维护，而不是继续跟上游——这是产品决策，不是补丁，
 见 charter 的 (a)/(b) 分工。
 
-**容器里的步骤会卡住不返回——这是 Colima 的问题，不是 act 的。** 在本机跑产物用例时反复出现：
+**容器里的步骤会长时间没反应——这是 Colima 的问题，不是 act 的。** 在本机跑产物用例时反复出现：
 `actions/cache` 的 post 步骤已经打印完 "Cache saved successfully"，但 act 的
 `waitForCommand` 还在等 docker exec 的输出流关闭，流一直没关。栈在 act 的容器层（`waitForCommand`
 还在等 docker exec 的输出流关闭），不在我们的代码里——两次 goroutine dump 里都没有
@@ -353,9 +378,16 @@ act 在读容器里的 `$GITHUB_PATH` 文件，**这个 Docker API 调用不返�
 | 用 `actions/cache` | 2/2 卡死 |
 
 cache 的 post 步骤刚好是 Docker API 流量最大的时刻（把一整个 tar 包穿过容器网络写到
-宿主机），之后紧接着的那次 archive 读取就挂住。Colima 本身不缺资源（6 CPU / 12GiB /
-60GiB，镜像才占 2GB）。**这大概率是 Docker-on-macOS（virtiofs + VM）特有的，
-生产用 Linux 原生 Docker 应该遇不到——但这一条需要在真机上验证。**
+宿主机），之后紧接着的那次 archive 读取就卡住。
+
+**程度不一**：上面那两次被 2 分钟的超时打断，看起来像永久卡死；但最后一轮全量验证里，
+同一个用例只是慢——produce + consume 花了三分多钟，最终正常完成、产物也正确跨过了
+job 边界。所以它是"Docker API 间歇性长时间无响应"，不总是"再也不回来"。
+超时定得短就会读成卡死。
+
+Colima 本身不缺资源（6 CPU / 12GiB / 60GiB，镜像才占 2GB）。**这大概率是
+Docker-on-macOS（virtiofs + VM）特有的，生产用 Linux 原生 Docker 应该遇不到——
+但这一条需要在真机上验证。**
 
 **兜底是两层独立的超时，都实测过**：
 

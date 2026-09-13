@@ -1,0 +1,36 @@
+# Orrery runner。
+#
+# 注意：runner 会执行 workflow 里的任意代码。上面控制面那套 sandbox 收紧在这里
+# 基本都不能用——容器 job 需要访问 docker socket，host job 需要能起进程。
+# 真正的隔离边界是「这台机器本身」：runner 必须跑在一台不承载应用和数据库的
+# 独立主机上。这是 FeedMob 自己那条规矩，README 的安全一节写了原因。
+[Unit]
+Description=Orrery runner
+Documentation=https://github.com/feed-mob/feedmob-orrery
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=orrery
+Group=docker
+EnvironmentFile=/etc/orrery/runner.env
+ExecStart=/usr/local/bin/orrery-runner \
+  -server http://127.0.0.1:8080 \
+  -credentials /var/lib/orrery-runner/credentials.json \
+  -work-dir /var/lib/orrery-runner/work \
+  -labels 'self-hosted:host,ubuntu-latest:docker://catthehacker/ubuntu:act-22.04'
+Restart=always
+RestartSec=5s
+StateDirectory=orrery-runner
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/orrery-runner
+
+# 有意只加这一条。ProtectSystem / PrivateDevices / SystemCallFilter 这些放在
+# 这里会挡掉 workflow 本来就该能做的事（写工作目录、起容器、监听产物与缓存
+# 服务端的端口），于是它们只会把「看起来收紧了」和「真的收紧了」混为一谈。
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -142,3 +142,36 @@ func (s *Server) startScheduled(ctx context.Context, sc store.Schedule) (int64, 
 	s.wake.broadcast()
 	return id, nil
 }
+
+// RunPruner enforces the retention window.
+//
+// Without it the database only grows: a repository building twenty times a day
+// keeps every log line of every run forever, and the first anyone hears about
+// it is a full disk on the control plane.
+func (s *Server) RunPruner(ctx context.Context) {
+	if s.cfg.Retention <= 0 {
+		return
+	}
+	// Hourly is plenty for a window measured in days, and cheap enough that the
+	// first sweep can happen at startup without anyone noticing.
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		runs, err := s.st.Prune(ctx, s.cfg.Retention)
+		if err != nil {
+			s.log.Error("pruning old runs failed", "err", err)
+		} else if runs > 0 {
+			s.log.Info("pruned runs past the retention window", "runs", runs, "retention", s.cfg.Retention)
+		}
+		// Deliveries live on a much shorter clock: GitHub will not redeliver a
+		// week-old event, so remembering it buys nothing.
+		if _, err := s.st.PruneDeliveries(ctx, 7*24*time.Hour); err != nil {
+			s.log.Error("pruning old deliveries failed", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
