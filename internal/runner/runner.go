@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,6 +76,25 @@ func (o *Options) withDefaults() {
 	}
 }
 
+// sanitizeName keeps a runner name usable inside a Docker object name: the
+// daemon accepts only [a-zA-Z0-9][a-zA-Z0-9_.-]*, and a hostname with a dot is
+// the common case.
+func sanitizeName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	if b.Len() == 0 {
+		return "runner"
+	}
+	return b.String()
+}
+
 // Version is what this runner advertises.
 const Version = "0.2.0-p0b"
 
@@ -86,11 +106,12 @@ var Capabilities = []string{protocol.CapabilityCancelling}
 
 // Runner polls for work and executes it.
 type Runner struct {
-	cl   *Client
-	opts Options
-	log  *slog.Logger
-	exec *actExecutor
-	svc  *services
+	cl    *Client
+	opts  Options
+	log   *slog.Logger
+	exec  *actExecutor
+	svc   *services
+	sweep *sweeper
 }
 
 // New builds a runner.
@@ -103,16 +124,21 @@ func New(cl *Client, opts Options, log *slog.Logger) *Runner {
 	if os.Getenv("DOCKER_HOST") == "" && opts.DockerHost != "" {
 		_ = os.Setenv("DOCKER_HOST", opts.DockerHost)
 	}
+	// Scoped to this runner so two runners sharing a daemon never sweep each
+	// other's work. The name is part of every container, volume and network.
+	prefix := fmt.Sprintf("ORRERY-%s-TASK-", sanitizeName(opts.Name))
 	return &Runner{
-		cl:   cl,
-		opts: opts,
-		log:  log,
+		cl:    cl,
+		opts:  opts,
+		log:   log,
+		sweep: &sweeper{prefix: prefix, log: log},
 		exec: &actExecutor{
-			labels:     opts.Labels,
-			actionsURL: opts.ActionsURL,
-			offline:    opts.ActionsOffline,
-			cacheDir:   defaultCacheDir(opts.WorkDir),
-			dockerHost: opts.DockerHost,
+			containerPrefix: prefix,
+			labels:          opts.Labels,
+			actionsURL:      opts.ActionsURL,
+			offline:         opts.ActionsOffline,
+			cacheDir:        defaultCacheDir(opts.WorkDir),
+			dockerHost:      opts.DockerHost,
 
 			mountDaemonSocket: opts.MountDockerSocket,
 		},
@@ -128,6 +154,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.svc = svc
 	r.exec.artifacts = svc
 	defer svc.close()
+
+	// Whatever the last run of this runner left behind is ours to clear, and
+	// nobody else's to notice.
+	r.sweep.sweep(ctx, "startup")
 
 	names := r.opts.Labels.Names()
 	if _, err = r.cl.Declare(ctx, &protocol.DeclareRequest{
@@ -290,6 +320,11 @@ func (r *Runner) execute(ctx context.Context, task *protocol.Task) error {
 		ackedAt = &now
 	}
 	logs.close(cleanupCtx)
+
+	// Sweep after every task, not only at startup: a long-lived runner that
+	// only tidies on restart accumulates the leftovers of every job the daemon
+	// stalled on.
+	r.sweep.sweep(cleanupCtx, "task complete")
 
 	r.log.Info("task complete", "task", task.ID, "result", final, "stopped", wasStopped, "steps", len(steps))
 	r.finish(cleanupCtx, task.ID, final, steps, outputs, ackedAt)

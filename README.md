@@ -360,6 +360,12 @@ Orrery 自己的 goroutine。
 
 **需要能被可靠停止的 job，用容器跑。**
 
+**卡死会漏容器，runner 自己会扫掉。** act 在收尾时删自己的容器、卷和网络，但那条路径
+走的是 Docker API——而"守护进程不响应"正是造成卡死的那个故障，于是清理根本跑不到。
+残留就一直占着磁盘等人发现。runner 现在**启动时和每个 task 结束后各扫一次**自己的残留。
+扫描按前缀 `ORRERY-<runner 名>-TASK-` 圈定：两个 runner 可以共用一个守护进程，
+扫掉别人正在跑的容器会是比这个泄漏更糟的 bug。
+
 **host 模式的 job 会继承 runner 进程的整个环境变量。** 这是 act host 模式的行为，
 GitHub 的 self-hosted runner 同样如此。默认标签里 `self-hosted:host` 是开着的，
 所以运行不可信代码的 runner 必须是独立主机——这正是 `agent-worker/README.md` 里那条规矩。

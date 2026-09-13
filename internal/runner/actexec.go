@@ -39,6 +39,10 @@ type actExecutor struct {
 	// dockerHost is where container jobs run. act defaults to
 	// /var/run/docker.sock, which is wrong on every VM-backed setup.
 	dockerHost string
+	// containerPrefix names every container, volume and network this runner
+	// creates, so the sweeper can recognise its own leftovers and — more to the
+	// point — cannot mistake another runner's live container for one.
+	containerPrefix string
 	// artifacts is the pair of servers a job's own steps talk back to. nil
 	// means actions/upload-artifact and actions/cache will fail, which is
 	// better than appearing to work and storing nothing.
@@ -146,7 +150,7 @@ func (e *actExecutor) run(ctx context.Context, task *protocol.Task, workdir stri
 		Actor:                 gh.Actor,
 		DefaultActionInstance: e.actionsURL,
 		PlatformPicker:        e.labels.PickPlatform,
-		ContainerNamePrefix:   fmt.Sprintf("ORRERY-TASK-%d", task.ID),
+		ContainerNamePrefix:   e.containerPrefix + strconv.FormatInt(task.ID, 10),
 		ContainerMaxLifetime:  lifetime(ctx, task),
 		ContainerDaemonSocket: e.daemonSocketMount(),
 		CleanWorkdir:          true,

@@ -271,3 +271,40 @@ func TestRedactAddMask(t *testing.T) {
 		}
 	}
 }
+
+// Two runners can share one daemon. A sweep that took the other one's live
+// container would be a worse bug than the leak it fixes.
+func TestSweeperOnlyClaimsItsOwnNames(t *testing.T) {
+	s := &sweeper{prefix: "ORRERY-builder-01-TASK-"}
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{
+		{"/ORRERY-builder-01-TASK-42-WORKFLOW-CI-JOB-build", true},
+		{"ORRERY-builder-01-TASK-42", true},
+		{"/ORRERY-builder-02-TASK-42-WORKFLOW-CI-JOB-build", false}, // another runner
+		{"/some-unrelated-container", false},
+		{"ORRERY-TASK-42", false}, // an older, unscoped name is not ours to judge
+	} {
+		if got := s.mine(tc.name); got != tc.want {
+			t.Errorf("mine(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// A sweeper with no prefix must do nothing rather than everything.
+	var none *sweeper
+	none.sweep(t.Context(), "test") // must not panic
+	(&sweeper{}).sweep(t.Context(), "test")
+}
+
+func TestSanitizeName(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"Yongchengs-MacBook-Pro.local", "Yongchengs-MacBook-Pro-local"},
+		{"builder_01", "builder_01"},
+		{"", "runner"},
+		{"...", "---"},
+	} {
+		if got := sanitizeName(tc.in); got != tc.want {
+			t.Errorf("sanitizeName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
