@@ -35,7 +35,9 @@ P0 的骨架与执行器都已跑通，以下条目**已验证可用**，不再�
 
 | 10 | job 级 `if:` | `examples/conditional.yml`：build 失败后 deploy skipped、`if: always()` 的 notify 与 `if: failure()` 的 rollback 都跑了 |
 
-**下一项**是 `concurrency` 并发组——两次快速 push 同时部署是真实风险，GitHub 有 `cancel-in-progress`，我们还没有。
+| 17 | 并发组 | `concurrency` / `cancel-in-progress`，且**平台默认开启**（GitHub 有但默认关，正是 #17 要改的那条） |
+
+**下一项**是 `on: schedule` 定时触发（#2）与 `workflow_dispatch` 带参手动触发（#3）。
 
 **已知边界**（见 README）：`GITHUB_API_URL` 对 github.com 是错的（`gitea/runner` v1.0.8 硬编码 Gitea 的 API 形状，无配置开关）；
 host 模式的 job 继承 runner 进程的环境变量；产物与缓存 action 必须钉 `@v3`，且属于产生它的那台 runner。

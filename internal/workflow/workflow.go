@@ -24,10 +24,12 @@ const DefaultTimeoutMinutes = 60
 
 // Workflow is a parsed workflow file.
 type Workflow struct {
-	Name string            `yaml:"name"`
-	On   any               `yaml:"on"`
-	Env  map[string]string `yaml:"env"`
-	Jobs map[string]*Job   `yaml:"jobs"`
+	Name string `yaml:"name"`
+	On   any    `yaml:"on"`
+	// RawConcurrency is `concurrency:`, read through Concurrency().
+	RawConcurrency any               `yaml:"concurrency"`
+	Env            map[string]string `yaml:"env"`
+	Jobs           map[string]*Job   `yaml:"jobs"`
 
 	// JobOrder preserves the order jobs appear in the file, which YAML maps
 	// lose. Dispatch does not depend on it, but stable ordering makes runs

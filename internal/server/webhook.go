@@ -227,6 +227,9 @@ func (s *Server) queueRun(ctx context.Context, wf *workflow.Workflow, f forge.Fi
 		Actor:        p.Sender.Login,
 		EventPayload: string(payload),
 	}
+	if err := s.applyConcurrency(wf, &run); err != nil {
+		return 0, err
+	}
 	id, err := s.st.CreateRun(ctx, run, jobs)
 	if err != nil {
 		return 0, err

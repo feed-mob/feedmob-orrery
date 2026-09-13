@@ -65,6 +65,8 @@ func addColumns(db *sql.DB) error {
 	for _, stmt := range []string{
 		`ALTER TABLE runs ADD COLUMN event_payload TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE runs ADD COLUMN run_number INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN cancel_in_progress INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("%s: %w", stmt, err)
@@ -260,6 +262,11 @@ type Run struct {
 	EventPayload string
 	// RunNumber is github.run_number: a counter per (repo, workflow file).
 	RunNumber int64
+	// ConcurrencyGroup serialises runs that share it; empty means no limit.
+	ConcurrencyGroup string
+	// CancelInProgress throws away the run already going instead of queueing
+	// behind it.
+	CancelInProgress bool
 }
 
 // Job is a stored job.
@@ -300,16 +307,39 @@ func (s *Store) CreateRun(ctx context.Context, run Run, jobs []NewJob) (int64, e
 	defer tx.Rollback()
 
 	now := ts(s.now())
+	// Decide the run's own status before inserting it: a run that has to wait
+	// for its group starts 'pending', and that is what keeps its jobs from
+	// being handed out even though they are queued.
+	status, superseded, cancel, err := admit(ctx, tx, run)
+	if err != nil {
+		return 0, err
+	}
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO runs (repo, workflow_name, workflow_file, event, ref, sha, actor, status, created_at, event_payload, run_number)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?,
-		        (SELECT COUNT(*) + 1 FROM runs WHERE repo = ? AND workflow_file = ?))`,
-		run.Repo, run.WorkflowName, run.WorkflowFile, run.Event, run.Ref, run.SHA, run.Actor, now,
-		run.EventPayload, run.Repo, run.WorkflowFile)
+		INSERT INTO runs (repo, workflow_name, workflow_file, event, ref, sha, actor, status, created_at,
+		                  event_payload, run_number, concurrency_group, cancel_in_progress)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		        (SELECT COUNT(*) + 1 FROM runs WHERE repo = ? AND workflow_file = ?), ?, ?)`,
+		run.Repo, run.WorkflowName, run.WorkflowFile, run.Event, run.Ref, run.SHA, run.Actor,
+		status, now, run.EventPayload, run.Repo, run.WorkflowFile,
+		run.ConcurrencyGroup, boolInt(run.CancelInProgress))
 	if err != nil {
 		return 0, fmt.Errorf("insert run: %w", err)
 	}
 	runID, _ := res.LastInsertId()
+
+	// A newer arrival supersedes the older waiter rather than forming a queue:
+	// by the time it would start, a build of the commit before last is almost
+	// never what anyone wanted.
+	for _, id := range superseded {
+		if err := cancelRun(ctx, tx, id, "concurrency", "superseded", now); err != nil {
+			return 0, err
+		}
+	}
+	for _, id := range cancel {
+		if err := cancelRun(ctx, tx, id, "concurrency", "cancel_in_progress", now); err != nil {
+			return 0, err
+		}
+	}
 
 	for _, j := range jobs {
 		status := "queued"
@@ -371,9 +401,13 @@ func (s *Store) ClaimJob(ctx context.Context, r *Runner) (*Job, error) {
 	}
 	defer tx.Rollback()
 
+	// The join is the concurrency gate: a run waiting for its group has queued
+	// jobs like any other, and they must not be handed out.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, run_id, job_key, name, needs, runs_on, payload, timeout_minutes
-		FROM jobs WHERE status = 'queued' ORDER BY id ASC`)
+		SELECT j.id, j.run_id, j.job_key, j.name, j.needs, j.runs_on, j.payload, j.timeout_minutes
+		FROM jobs j JOIN runs r ON r.id = j.run_id
+		WHERE j.status = 'queued' AND r.status != 'pending'
+		ORDER BY j.id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -481,4 +515,113 @@ func (s *Store) NeedsContext(ctx context.Context, runID int64, needs []string) (
 		outputs[key] = kv
 	}
 	return outputs, results, nil
+}
+
+// ---------------------------------------------------------- concurrency --
+
+// admit decides how a new run enters its concurrency group, and what that does
+// to the runs already in it.
+//
+// GitHub's rules, which this follows: one run of a group is in flight at a
+// time; at most one waits behind it, and a newer arrival supersedes the older
+// waiter rather than forming a queue — a build of the commit before last is
+// almost never what anyone wanted by the time it would start. With
+// cancel-in-progress the newcomer takes over instead of waiting.
+//
+// It returns the new run's status, the ids of runs superseded while waiting,
+// and the ids of runs to cancel because the newcomer is taking over.
+func admit(ctx context.Context, tx *sql.Tx, run Run) (status string, superseded, cancel []int64, err error) {
+	if run.ConcurrencyGroup == "" {
+		return "queued", nil, nil, nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, status FROM runs
+		WHERE concurrency_group = ? AND status IN ('pending', 'queued', 'running')
+		ORDER BY id ASC`, run.ConcurrencyGroup)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	defer rows.Close()
+
+	var inFlight, waiting []int64
+	for rows.Next() {
+		var id int64
+		var st string
+		if err := rows.Scan(&id, &st); err != nil {
+			return "", nil, nil, err
+		}
+		if st == "pending" {
+			waiting = append(waiting, id)
+		} else {
+			inFlight = append(inFlight, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", nil, nil, err
+	}
+
+	if len(inFlight) == 0 {
+		// Nothing is going; anything that was waiting is now stale.
+		return "queued", waiting, nil, nil
+	}
+	if run.CancelInProgress {
+		return "queued", waiting, inFlight, nil
+	}
+	return "pending", waiting, nil, nil
+}
+
+// cancelRun stops a run and everything of it that has not finished.
+//
+// A running job is asked to stop rather than killed: the runner acknowledges
+// once it has wound down, and the reaper takes it away only if it does not.
+// Jobs that never started are simply marked, because there is nothing holding
+// anything to wind down.
+func cancelRun(ctx context.Context, tx *sql.Tx, runID int64, by, reason, now string) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET stop_requested_at = COALESCE(stop_requested_at, ?), stop_requested_by = ?,
+		                stop_reason = CASE WHEN stop_reason = '' THEN ? ELSE stop_reason END
+		WHERE run_id = ? AND status = 'running'`, now, by, reason, runID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET status = 'done', result = 'cancelled', stopped_at = ?,
+		                stop_reason = CASE WHEN stop_reason = '' THEN ? ELSE stop_reason END
+		WHERE run_id = ? AND status IN ('queued', 'blocked')`, now, reason, runID); err != nil {
+		return err
+	}
+	// A run with nothing left running settles immediately; one with a job still
+	// winding down settles when that job reports.
+	var running int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs WHERE run_id = ? AND status = 'running'`, runID).Scan(&running); err != nil {
+		return err
+	}
+	if running > 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx,
+		`UPDATE runs SET status = 'done', result = 'cancelled', stopped_at = ? WHERE id = ?`, now, runID)
+	return err
+}
+
+// promoteGroup starts the oldest run waiting on a group, now that the group is
+// free. Nothing to do when the group is empty or still busy.
+func promoteGroup(ctx context.Context, tx *sql.Tx, group string) error {
+	if group == "" {
+		return nil
+	}
+	var busy int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM runs WHERE concurrency_group = ? AND status IN ('queued', 'running')`,
+		group).Scan(&busy); err != nil {
+		return err
+	}
+	if busy > 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = 'queued'
+		WHERE id = (SELECT id FROM runs WHERE concurrency_group = ? AND status = 'pending'
+		            ORDER BY id ASC LIMIT 1)`, group)
+	return err
 }

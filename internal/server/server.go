@@ -57,6 +57,14 @@ type Config struct {
 	// PublicURL is where a human can reach this server, used as the target of
 	// commit statuses. Empty means the status links nowhere.
 	PublicURL string
+	// DefaultConcurrency is the group applied to a workflow that declares none.
+	// GitHub has concurrency and defaults it off, which is why twelve of our
+	// thirteen workflows can have two pushes deploying at once. The default
+	// here queues rather than cancels: waiting loses no work.
+	//
+	// It is an expression, interpolated like any group. Empty restores
+	// GitHub's behaviour of no limit at all.
+	DefaultConcurrency string
 }
 
 // Forge is the code host a run belongs to.
@@ -530,6 +538,10 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 	run := store.Run{
 		Repo: req.Repo, WorkflowName: wf.Name, WorkflowFile: req.WorkflowFile,
 		Event: orDefault(req.Event, "manual"), Ref: req.Ref, SHA: req.SHA, Actor: req.Actor,
+	}
+	if err := s.applyConcurrency(wf, &run); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	runID, err := s.st.CreateRun(r.Context(), run, jobs)
 	if err != nil {

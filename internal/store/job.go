@@ -272,6 +272,12 @@ func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string, g JobGa
 		result, now, runID); err != nil {
 		return nil, err
 	}
+	// The group is free now, so whatever was waiting behind this run can start.
+	// Doing it here rather than on a timer is what keeps a queued deploy from
+	// sitting still after the one ahead of it finished.
+	if err := promoteGroup(ctx, tx, meta.ConcurrencyGroup); err != nil {
+		return nil, err
+	}
 	return &RunOutcome{RunID: runID, Result: result}, nil
 }
 
@@ -631,9 +637,10 @@ func runInTx(ctx context.Context, tx *sql.Tx, runID int64) (*Run, error) {
 	var r Run
 	err := tx.QueryRowContext(ctx, `
 		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result,
-		       event_payload, run_number
+		       event_payload, run_number, concurrency_group
 		FROM runs WHERE id = ?`, runID).Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile,
-		&r.Event, &r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &r.EventPayload, &r.RunNumber)
+		&r.Event, &r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &r.EventPayload, &r.RunNumber,
+		&r.ConcurrencyGroup)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

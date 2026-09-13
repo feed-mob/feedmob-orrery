@@ -59,8 +59,15 @@ CREATE TABLE IF NOT EXISTS runs (
     -- github.run_number: a per-workflow counter, not the primary key. Workflows
     -- put it in image tags and release names, where a number that jumps because
     -- another workflow ran in between is a bug people chase for hours.
-    run_number    INTEGER NOT NULL DEFAULT 0
+    run_number    INTEGER NOT NULL DEFAULT 0,
+    -- Runs sharing a group run one at a time. status 'pending' means the run is
+    -- waiting for its group, and is the reason ClaimJob joins back to runs:
+    -- a pending run's jobs are queued but must not be handed out.
+    concurrency_group  TEXT    NOT NULL DEFAULT '',
+    cancel_in_progress INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE INDEX IF NOT EXISTS idx_runs_group ON runs (concurrency_group, status);
 
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (status);
 

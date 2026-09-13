@@ -135,6 +135,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | 日志流：增量提交 + 服务端 ack 定义投递 | ✅ 重复窗口幂等，跳跃窗口被拒 |
 | **带确认的停止**：请求 → 确认 → 超时强杀 | ✅ 台账区分 `cleanup_ran=true/false`；被打断的步骤记 `cancelled` 而非 `failure` |
 | 平台级默认超时 | ✅ 作者可下调，不可遗漏 |
+| **并发组**（#17） | ✅ `concurrency` / `cancel-in-progress`；**平台默认开启**，见下 |
 | **`uses:` action** | ✅ `actions/checkout@v4` + `actions/setup-node@v4` 已端到端跑通 |
 | **容器执行** | ✅ `ubuntu-latest:docker://…` 起容器；`self-hosted:host` 跑宿主机；同一 runner 兼顾 |
 | 表达式、`::group::`、`::error::`、矩阵、`services`、composite action | ✅ 由 act 承担（见 L2） |
@@ -174,6 +175,25 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 installation token 能创建**，PAT 和 OAuth token 一律被拒。Commit Status 任何能写
 仓库的 token 都能用，分支保护的 required checks 同样认它。等 Orrery 有了自己的
 GitHub App，再升级到 Checks API 拿 diff 行内注解。
+
+### 并发组：默认开启
+
+GitHub 有 `concurrency`，默认关着——所以你们十三个 workflow 里没人写，两次快速
+push 可以同时部署到同一台机器。Orrery 保留语法，改掉默认：
+
+```
+-default-concurrency '${{ github.workflow }}@${{ github.ref }}'   # 默认值
+```
+
+没写 `concurrency:` 的 workflow 自动落进这个组，同组的 run 排队而不是并跑。
+默认是**排队不取消**——等待不丢弃任何工作，取消会。写了 `concurrency:` 的以
+workflow 自己的为准，包括 `cancel-in-progress: true`。把这个 flag 设成空串就
+恢复 GitHub 的行为（完全不限制）。
+
+规则和 GitHub 一致：一个组同时只有一个 run 在跑，后面最多只排一个——再来一个
+会把排队中的那个作废（`superseded`），因为等它开跑时"上上个 commit 的部署"几乎
+不会是任何人想要的。`cancel-in-progress` 是**请求**正在跑的 job 停下并等它确认，
+不是直接杀掉。
 
 ### 产物与缓存
 

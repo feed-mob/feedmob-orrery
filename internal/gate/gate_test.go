@@ -118,3 +118,28 @@ func TestBadExpressionIsAnError(t *testing.T) {
 func githubAt(ref string) *model.GithubContext {
 	return &model.GithubContext{Ref: ref}
 }
+
+// A concurrency group means nothing until the run's own context fills it in.
+func TestInterpolate(t *testing.T) {
+	env := Env{Github: &model.GithubContext{
+		Workflow: "Deploy", Ref: "refs/heads/main", EventName: "push",
+	}}
+	for _, tc := range []struct{ in, want string }{
+		{"deploy", "deploy"},
+		{"${{ github.workflow }}@${{ github.ref }}", "Deploy@refs/heads/main"},
+		{"x-${{ github.event_name }}-y", "x-push-y"},
+		{"${{ github.ref == 'refs/heads/main' }}", "true"},
+	} {
+		got, err := Interpolate(tc.in, env)
+		if err != nil {
+			t.Errorf("Interpolate(%q): %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("Interpolate(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if _, err := Interpolate("${{ github.ref", env); err == nil {
+		t.Error("an unterminated expression was accepted")
+	}
+}

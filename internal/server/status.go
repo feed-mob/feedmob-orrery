@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/feed-mob/feedmob-orrery/internal/forge"
+	"github.com/feed-mob/feedmob-orrery/internal/gate"
 	"github.com/feed-mob/feedmob-orrery/internal/store"
+	"github.com/feed-mob/feedmob-orrery/internal/workflow"
 )
 
 // reportStatus writes a run's state back to the forge, where branch protection
@@ -96,4 +98,37 @@ func (s *Server) announce(ctx context.Context, outcome *store.RunOutcome) {
 	}
 	state, desc := statusFor(outcome.Result)
 	s.reportStatus(run, state, desc)
+}
+
+// applyConcurrency resolves the run's concurrency group.
+//
+// The group is an expression — almost always `${{ github.workflow }}-${{
+// github.ref }}` — and means nothing until the run's own context fills it in.
+// A workflow that declares none gets the platform default, which is the
+// difference between "GitHub has this feature and you forgot to use it" and
+// "two pushes cannot deploy at the same time".
+func (s *Server) applyConcurrency(wf *workflow.Workflow, run *store.Run) error {
+	c, err := wf.Concurrency()
+	if err != nil {
+		return err
+	}
+	expr := s.cfg.DefaultConcurrency
+	if c != nil {
+		expr, run.CancelInProgress = c.Group, c.CancelInProgress
+	}
+	if expr == "" {
+		return nil
+	}
+	group, err := gate.Interpolate(expr, gate.Env{
+		Github: gate.GithubFor(run.Repo, run.Ref, run.SHA, run.Actor, run.Event,
+			run.WorkflowName, "0", "0", run.EventPayload),
+		Vars: s.cfg.Vars,
+	})
+	if err != nil {
+		return fmt.Errorf("concurrency group: %w", err)
+	}
+	// Scope the group to the repository. Two repositories that happen to have a
+	// workflow called "Deploy" are not competing for anything.
+	run.ConcurrencyGroup = run.Repo + "/" + group
+	return nil
 }

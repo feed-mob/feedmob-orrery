@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -116,5 +117,105 @@ func TestPropagateAsksTheGate(t *testing.T) {
 	}
 	if len(asked) != 2 {
 		t.Errorf("gate was asked about %v, want both dependents", asked)
+	}
+}
+
+// GitHub has concurrency and defaults it off, which is why two pushes can
+// deploy at the same time and nobody notices until they do.
+func TestConcurrencyGroupSerialisesRuns(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := newRunner(t, st, []string{"self-hosted"}, nil)
+
+	newRun := func(cancelInProgress bool) int64 {
+		id, err := st.CreateRun(ctx, Run{
+			Repo: "feed-mob/app", WorkflowName: "Deploy",
+			ConcurrencyGroup: "feed-mob/app/Deploy@main", CancelInProgress: cancelInProgress,
+		}, []NewJob{{Key: "deploy", Payload: "p", RunsOn: []string{"self-hosted"}}})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		return id
+	}
+	statusOf := func(id int64) string {
+		sum, err := st.RunByID(ctx, id)
+		if err != nil {
+			t.Fatalf("read run %d: %v", id, err)
+		}
+		return sum.Run.Status + "/" + sum.Run.Result
+	}
+
+	first := newRun(false)
+	if _, err := st.ClaimJob(ctx, r); err != nil {
+		t.Fatalf("first run should be claimable: %v", err)
+	}
+
+	// A second run in the same group waits, and its jobs stay out of reach even
+	// though they are queued.
+	second := newRun(false)
+	if got := statusOf(second); got != "pending/" {
+		t.Fatalf("second run = %q, want pending", got)
+	}
+	if _, err := st.ClaimJob(ctx, r); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a pending run's job was handed out: %v", err)
+	}
+
+	// A third supersedes the second: by the time it would start, a deploy of
+	// the commit before last is not what anyone wanted.
+	third := newRun(false)
+	if got := statusOf(second); got != "done/cancelled" {
+		t.Errorf("second run = %q, want cancelled as superseded", got)
+	}
+	if got := statusOf(third); got != "pending/" {
+		t.Errorf("third run = %q, want pending", got)
+	}
+
+	// Finishing the first frees the group and starts the one waiting.
+	sum, _ := st.RunByID(ctx, first)
+	if _, err := st.FinishJob(ctx, sum.Jobs[0].ID, "success"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if got := statusOf(third); got != "queued/" {
+		t.Errorf("third run = %q after the group freed, want queued", got)
+	}
+	if _, err := st.ClaimJob(ctx, r); err != nil {
+		t.Fatalf("promoted run should be claimable: %v", err)
+	}
+}
+
+// cancel-in-progress asks the running job to wind down rather than killing it:
+// a stop you cannot confirm is not a stop.
+func TestCancelInProgressAsksTheRunningJobToStop(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := newRunner(t, st, []string{"self-hosted"}, nil)
+
+	first, err := st.CreateRun(ctx, Run{
+		Repo: "feed-mob/app", WorkflowName: "Deploy", ConcurrencyGroup: "g", CancelInProgress: true,
+	}, []NewJob{{Key: "deploy", Payload: "p", RunsOn: []string{"self-hosted"}}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	job, err := st.ClaimJob(ctx, r)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	if _, err := st.CreateRun(ctx, Run{
+		Repo: "feed-mob/app", WorkflowName: "Deploy", ConcurrencyGroup: "g", CancelInProgress: true,
+	}, []NewJob{{Key: "deploy", Payload: "p", RunsOn: []string{"self-hosted"}}}); err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+
+	pending, err := st.StopPending(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("stop pending: %v", err)
+	}
+	if !pending {
+		t.Error("the running job was not asked to stop")
+	}
+	sum, _ := st.RunByID(ctx, first)
+	if sum.Run.Status == "done" {
+		t.Error("the run settled before its job acknowledged; a stop you cannot confirm is not a stop")
 	}
 }

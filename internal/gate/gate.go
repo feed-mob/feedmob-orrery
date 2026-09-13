@@ -143,3 +143,63 @@ func truthy(v any) bool {
 		return true
 	}
 }
+
+// Interpolate resolves `${{ … }}` in a string against the same contexts a
+// job-level `if:` may read. Used for `concurrency.group`, which is almost
+// always `${{ github.workflow }}-${{ github.ref }}` and means nothing until
+// those are filled in.
+func Interpolate(s string, env Env) (string, error) {
+	if !strings.Contains(s, "${{") {
+		return s, nil
+	}
+	interp := exprparser.NewInterpeter(&exprparser.EvaluationEnvironment{
+		Github: env.Github,
+		Vars:   env.Vars,
+		Inputs: env.Inputs,
+		Needs:  map[string]exprparser.Needs{},
+		Job:    &model.JobContext{},
+	}, exprparser.Config{Context: "job"})
+
+	var out strings.Builder
+	rest := s
+	for {
+		open := strings.Index(rest, "${{")
+		if open < 0 {
+			out.WriteString(rest)
+			return out.String(), nil
+		}
+		close := strings.Index(rest[open:], "}}")
+		if close < 0 {
+			return "", fmt.Errorf("unterminated ${{ in %q", s)
+		}
+		out.WriteString(rest[:open])
+		expr := strings.TrimSpace(rest[open+3 : open+close])
+		v, err := interp.Evaluate(expr, exprparser.DefaultStatusCheckNone)
+		if err != nil {
+			return "", fmt.Errorf("evaluate %q: %w", expr, err)
+		}
+		out.WriteString(asString(v))
+		rest = rest[open+close+2:]
+	}
+}
+
+func asString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case float64:
+		if x == float64(int64(x)) {
+			return fmt.Sprintf("%d", int64(x))
+		}
+		return fmt.Sprintf("%v", x)
+	default:
+		return fmt.Sprintf("%v", x)
+	}
+}
