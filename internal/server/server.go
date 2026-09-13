@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/feed-mob/feedmob-orrery/internal/forge"
+	"github.com/feed-mob/feedmob-orrery/internal/notify"
 	"github.com/feed-mob/feedmob-orrery/internal/protocol"
 	"github.com/feed-mob/feedmob-orrery/internal/store"
 	"github.com/feed-mob/feedmob-orrery/internal/workflow"
@@ -61,6 +62,9 @@ type Config struct {
 	// PublicURL is where a human can reach this server, used as the target of
 	// commit statuses. Empty means the status links nowhere.
 	PublicURL string
+	// NotifyWebhook receives a message when a workflow's verdict changes.
+	// Slack-shaped {"text": …}, which Mattermost and Discord also accept.
+	NotifyWebhook string
 	// DefaultConcurrency is the group applied to a workflow that declares none.
 	// GitHub has concurrency and defaults it off, which is why twelve of our
 	// thirteen workflows can have two pushes deploying at once. The default
@@ -122,12 +126,13 @@ func (c *Config) withDefaults() {
 
 // Server wires the store to HTTP.
 type Server struct {
-	st    *store.Store
-	cfg   Config
-	log   *slog.Logger
-	mux   *http.ServeMux
-	wake  *notifier
-	forge *forge.Client
+	st       *store.Store
+	cfg      Config
+	log      *slog.Logger
+	mux      *http.ServeMux
+	wake     *notifier
+	forge    *forge.Client
+	notifier *notify.Webhook
 }
 
 // New builds a server.
@@ -135,7 +140,8 @@ func New(st *store.Store, cfg Config, log *slog.Logger) *Server {
 	cfg.withDefaults()
 	s := &Server{
 		st: st, cfg: cfg, log: log, mux: http.NewServeMux(), wake: newNotifier(),
-		forge: forge.New(cfg.Forge.APIURL, cfg.ForgeToken),
+		forge:    forge.New(cfg.Forge.APIURL, cfg.ForgeToken),
+		notifier: notify.New(cfg.NotifyWebhook),
 	}
 	s.routes()
 	return s

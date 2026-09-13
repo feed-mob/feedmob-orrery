@@ -8,6 +8,7 @@ import (
 
 	"github.com/feed-mob/feedmob-orrery/internal/forge"
 	"github.com/feed-mob/feedmob-orrery/internal/gate"
+	"github.com/feed-mob/feedmob-orrery/internal/notify"
 	"github.com/feed-mob/feedmob-orrery/internal/store"
 	"github.com/feed-mob/feedmob-orrery/internal/workflow"
 )
@@ -84,6 +85,43 @@ func statusFor(result string) (forge.State, string) {
 	}
 }
 
+// notifyIfChanged tells people when a workflow's verdict changes.
+//
+// Scoped to repo + workflow file + ref, so a failing nightly job and a failing
+// deploy of the same repo are two different stories, and a branch that is
+// always red does not drown out main going red.
+func (s *Server) notifyIfChanged(ctx context.Context, run *store.Run) {
+	if s.notifier == nil || run == nil {
+		return
+	}
+	scope := run.Repo + "\x00" + run.WorkflowFile + "\x00" + run.Ref
+	previous, changed, err := s.st.NoteResult(ctx, scope, run.Result)
+	if err != nil {
+		s.log.Error("recording the notification state failed", "run", run.ID, "err", err)
+		return
+	}
+	if !changed {
+		return
+	}
+	msg := notify.Message(notify.Event{
+		Repo: run.Repo, Workflow: orDefault(run.WorkflowName, run.WorkflowFile),
+		Ref: run.Ref, SHA: run.SHA, Actor: run.Actor, EventName: run.Event,
+		Result: run.Result, Previous: previous,
+		RunID: run.ID, RunAttempt: run.RunAttempt, URL: s.runURL(run.ID),
+	})
+	// Detached for the same reason the commit status is: a run must not fail
+	// because telling people about it did.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := s.notifier.Send(ctx, msg); err != nil {
+			s.log.Error("notification failed", "run", run.ID, "err", err)
+			return
+		}
+		s.log.Info("notified", "run", run.ID, "result", run.Result, "previous", previous)
+	}()
+}
+
 // announce reports a settled run to the forge. A nil outcome means the run
 // still has jobs in flight, which is the common case — a run of four jobs
 // settles once, not four times.
@@ -98,6 +136,7 @@ func (s *Server) announce(ctx context.Context, outcome *store.RunOutcome) {
 	}
 	state, desc := statusFor(outcome.Result)
 	s.reportStatus(run, state, desc)
+	s.notifyIfChanged(ctx, run)
 }
 
 // applyConcurrency resolves the run's concurrency group.

@@ -41,6 +41,8 @@ P0 的骨架与执行器都已跑通，以下条目**已验证可用**，不再�
 | 3 | 带参手动触发 | `workflow_dispatch` inputs，run 创建前校验；`orrery dispatch` |
 | 4 53 | API 触发与管理 API | `POST /api/dispatch`、`/api/runs`、`/api/webhooks/github` |
 
+| 32 | Web UI | 编译进二进制、无 CDN；run 列表、步骤时间线、日志、重跑、停止 |
+| 50 | 运行通知 | 变化才发（失败 / 恢复），作用域 repo+workflow+ref |
 | 53 | 重跑 | `rerun [--failed]`，run 不变 attempt +1；日志按 attempt 归档，旧的不被覆盖 |
 
 **P0 的触发—执行—回写闭环到此完整。** 剩下的 P0 级缺口只有 `permissions:` 收窄 token（#45），

@@ -157,6 +157,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **状态回写**（#47） | ✅ Commit Status API，`orrery / <workflow>`；入队 pending、落定终态 |
 | **产物与缓存**（#27 #28） | ✅ runner 内置产物与缓存服务端；跨 job 传产物已验证。**必须钉 v3**，见下 |
 | **job 级 `if:`** | ✅ `always()` / `failure()` / `cancelled()` 与任意表达式，用 act 自己的解释器求值 |
+| **通知**（#50） | ✅ 变化才发：失败发一条、连着失败不重复、恢复再发一条；Slack 形状的 webhook |
 | **Web UI**（#32） | ✅ 编译进二进制，无 CDN；run 列表、步骤时间线、日志、重跑、停止；深色与手机适配 |
 | **重跑**（#53） | ✅ `rerun [--failed]`：run 保持不变、attempt +1；成功 job 的产物与 outputs 留着给被重跑的用 |
 | `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
@@ -192,6 +193,25 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 installation token 能创建**，PAT 和 OAuth token 一律被拒。Commit Status 任何能写
 仓库的 token 都能用，分支保护的 required checks 同样认它。等 Orrery 有了自己的
 GitHub App，再升级到 Checks API 拿 diff 行内注解。
+
+### 通知
+
+```
+-notify-webhook https://hooks.slack.com/services/...
+```
+
+发的是 Slack 形状的 `{"text": …}`——Mattermost 和 Discord 的 `/slack` 端点也认。
+一个每个聊天系统都已经懂的字段，胜过只有其中一家能渲染的复杂结构。
+
+**只发变化，不是每个 run 都发。** 一个已经红了六小时的 workflow 应该只产生过一条
+消息，不是十二条。这就是评估标尺 D4 里"告警去重"那条。具体规则：
+
+- 第一次失败 → 发
+- 接着又失败 → 不发（同一件坏掉的事）
+- 失败之后第一次成功 → 发「恢复了」
+- 一开始就成功 → 不发（没人需要被告知"你刚配好的 workflow 正常工作"）
+
+作用域是 **仓库 + workflow 文件 + ref**，所以一个天天红的分支不会盖住 main 变红。
 
 ### Web UI
 

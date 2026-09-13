@@ -33,6 +33,8 @@ func main() {
 		forgeToken  = flag.String("forge-token", os.Getenv("ORRERY_FORGE_TOKEN"), "token used to read workflow files and write commit statuses; without it webhooks cannot read a private repo and results are not reported back")
 		hookSecret  = flag.String("webhook-secret", os.Getenv("ORRERY_WEBHOOK_SECRET"), "shared secret GitHub signs webhook deliveries with; empty disables the webhook endpoint")
 		publicURL   = flag.String("public-url", os.Getenv("ORRERY_PUBLIC_URL"), "where humans reach this server; used as the target of commit statuses")
+		notifyHook  = flag.String("notify-webhook", os.Getenv("ORRERY_NOTIFY_WEBHOOK"),
+			"chat webhook that receives a message when a workflow's verdict changes (Slack-shaped {\"text\"}); only changes are sent, not every run")
 		defaultConc = flag.String("default-concurrency", "${{ github.workflow }}@${{ github.ref }}",
 			"concurrency group applied to a workflow that declares none; runs sharing a group queue rather than race. Empty restores GitHub's behaviour of no limit")
 		verbose = flag.Bool("v", false, "debug logging")
@@ -86,6 +88,7 @@ func main() {
 		WebhookSecret:      *hookSecret,
 		PublicURL:          *publicURL,
 		DefaultConcurrency: *defaultConc,
+		NotifyWebhook:      *notifyHook,
 	}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -112,7 +115,7 @@ func main() {
 	log.Info("orrery server listening", "addr", *addr, "db", *dbPath,
 		"stop_grace", *grace, "forge", *forgeURL,
 		"forge_token", *forgeToken != "", "webhooks", *hookSecret != "",
-		"default_concurrency", *defaultConc,
+		"default_concurrency", *defaultConc, "notify", *notifyHook != "",
 		"secrets", keysOf(secrets))
 	log.Info("dashboard", "url", orDefault(*publicURL, "http://"+strings.TrimPrefix(*addr, ":")+"/"))
 	if *hookSecret == "" {

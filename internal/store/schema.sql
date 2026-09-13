@@ -178,3 +178,14 @@ CREATE TABLE IF NOT EXISTS schedules (
 );
 
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules (next_due_at);
+
+-- What we last told people about each workflow-and-ref.
+--
+-- Notification is transition-based: a workflow that has been failing for six
+-- hours should have produced one message, not twelve. This table is the memory
+-- that makes "changed" answerable.
+CREATE TABLE IF NOT EXISTS notify_state (
+    scope       TEXT PRIMARY KEY,   -- repo + workflow file + ref
+    result      TEXT NOT NULL,
+    notified_at TEXT NOT NULL
+);
