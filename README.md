@@ -99,9 +99,57 @@ Orrery 读得懂现有的 workflow 文件，但底下是我们自己的引擎。
 
 ---
 
+## 跑起来
+
+```bash
+go build -o bin/ ./cmd/...
+export ORRERY_REGISTRATION_TOKEN=$(openssl rand -hex 16)
+
+./bin/orrery-server -db orrery.db &          # 控制面
+./bin/orrery-runner -labels self-hosted &    # runner，首次用注册令牌换自己的令牌
+
+./bin/orrery submit examples/hello.yml --wait
+./bin/orrery runs
+./bin/orrery logs <job-id>
+./bin/orrery stop <job-id>                   # 请求停止；runner 收尾后确认
+```
+
+### P0a 已经能做什么
+
+| | 状态 |
+|---|---|
+| workflow 解析（`jobs` / `needs` / `runs-on` / `timeout-minutes` / `env` / `run` 步骤） | ✅ 含依赖环检测与未知 `needs` 校验 |
+| runner.v1 协议（`Register` / `Declare` / `FetchTask` / `UpdateTask` / `UpdateLog`） | ✅ Connect 风格 JSON over HTTP |
+| 调度：`needs` DAG、标签匹配、原子抢占 | ✅ 上游失败时下游标 `skipped` 而非永久阻塞 |
+| 日志流：增量提交 + 服务端 ack 定义投递 | ✅ 重复窗口幂等，跳跃窗口被拒 |
+| **带确认的停止**：请求 → 确认 → 超时强杀 | ✅ 台账区分 `cleanup_ran=true/false` |
+| 平台级默认超时 | ✅ 作者可下调，不可遗漏 |
+| `uses:` action | ⛔ P0b（需 vendor `gitea/runner` 的 `act/`） |
+| 容器执行 | ⛔ 本机未装 Docker，当前走 host 模式 |
+| 状态回写 GitHub Checks API（#47） | ⛔ P0b |
+
+### 两条设计不要"顺手简化"掉
+
+**超时是 NOT NULL 且有平台默认值。** Tekton、Argo、Dagger 三家形状一致：默认值属于平台、不属于流水线作者。我们 13 个 workflow 里 12 个没写超时，不是疏忽，是 GitHub 没有组织级默认值、忘记写不要钱。这里忘不掉。
+
+**停止是三列不是一个布尔。** `stop_requested_at` 记录请求，`stop_acked_at` 记录 runner 确认已收尾，`force_terminated` 记录我们放弃等待。**一个你无法确认的停止不是停止**——Mobius 曾因此让两次生产对话永久失声。强杀时 `cleanup_ran` 留在 0，台账明说它握着的东西从没释放。
+
+---
+
 ## 仓库结构
 
 ```
+cmd/
+  orrery-server/           控制面：runner RPC、提交 API、回收器
+  orrery-runner/           agent：取活、执行、流式回传日志
+  orrery/                  CLI：submit / runs / run / logs / stop
+internal/
+  protocol/                runner.v1 线契约
+  store/                   SQLite：runs / jobs / runners / logs
+  server/                  HTTP 路由与回收器
+  runner/                  取活循环、host 执行器、日志发运
+  workflow/                workflow YAML 解析与校验
+examples/
 docs/
   charter.md               目标形态：分层决策、四阶段、验收、开放问题
   feature-inventory.md     76 项功能盘点与对标（GitHub Actions 逐项核对 + 竞品签名功能）

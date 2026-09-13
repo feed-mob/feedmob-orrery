@@ -1,0 +1,496 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// JobByID loads a single job.
+func (s *Store) JobByID(ctx context.Context, id int64) (*Job, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, run_id, job_key, name, needs, runs_on, payload, status, result, timeout_minutes,
+		       runner_id, started_at, stopped_at, stop_requested_at, stop_reason, stop_acked_at,
+		       force_terminated, cleanup_ran
+		FROM jobs WHERE id = ?`, id)
+	return scanJob(row)
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanJob(row rowScanner) (*Job, error) {
+	var j Job
+	var needs, runsOn string
+	var runnerID sql.NullInt64
+	var started, stopped, stopReq, stopAck sql.NullString
+	var force, cleanup int
+	err := row.Scan(&j.ID, &j.RunID, &j.Key, &j.Name, &needs, &runsOn, &j.Payload, &j.Status, &j.Result,
+		&j.TimeoutMinutes, &runnerID, &started, &stopped, &stopReq, &j.StopReason, &stopAck, &force, &cleanup)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	j.Needs, j.RunsOn = decodeStrings(needs), decodeStrings(runsOn)
+	if runnerID.Valid {
+		v := runnerID.Int64
+		j.RunnerID = &v
+	}
+	j.StartedAt, j.StoppedAt = parseTS(started), parseTS(stopped)
+	j.StopRequestedAt, j.StopAckedAt = parseTS(stopReq), parseTS(stopAck)
+	j.ForceTerminated, j.CleanupRan = force == 1, cleanup == 1
+	return &j, nil
+}
+
+// SetOutputs merges outputs reported by a runner. The runner only sends what it
+// has not sent before, so this is an upsert, never a replace.
+func (s *Store) SetOutputs(ctx context.Context, jobID int64, outputs map[string]string) ([]string, error) {
+	for k, v := range outputs {
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO job_outputs (job_id, key, value) VALUES (?, ?, ?)
+			ON CONFLICT (job_id, key) DO UPDATE SET value = excluded.value`, jobID, k, v); err != nil {
+			return nil, err
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT key FROM job_outputs WHERE job_id = ?`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var sent []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		sent = append(sent, k)
+	}
+	return sent, rows.Err()
+}
+
+// StepReport is one step's state as reported by the runner.
+type StepReport struct {
+	Index     int
+	Name      string
+	Result    string
+	StartedAt *time.Time
+	StoppedAt *time.Time
+	LogIndex  int64
+	LogLength int64
+}
+
+// SetSteps upserts per-step state.
+func (s *Store) SetSteps(ctx context.Context, jobID int64, steps []StepReport) error {
+	for _, st := range steps {
+		var started, stopped any
+		if st.StartedAt != nil {
+			started = ts(*st.StartedAt)
+		}
+		if st.StoppedAt != nil {
+			stopped = ts(*st.StoppedAt)
+		}
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO job_steps (job_id, step_index, name, result, started_at, stopped_at, log_index, log_length)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (job_id, step_index) DO UPDATE SET
+				name = excluded.name, result = excluded.result,
+				started_at = excluded.started_at, stopped_at = excluded.stopped_at,
+				log_index = excluded.log_index, log_length = excluded.log_length`,
+			jobID, st.Index, st.Name, st.Result, started, stopped, st.LogIndex, st.LogLength); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FinishJob records a terminal result and propagates it through the DAG:
+// dependents whose needs are now all satisfied move to 'queued'; dependents of a
+// failed or cancelled job are cancelled themselves rather than left blocked
+// forever.
+func (s *Store) FinishJob(ctx context.Context, jobID int64, result string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := ts(s.now())
+	var runID int64
+	if err := tx.QueryRowContext(ctx, `SELECT run_id FROM jobs WHERE id = ?`, jobID).Scan(&runID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET status = 'done', result = ?, stopped_at = COALESCE(stopped_at, ?) WHERE id = ?`,
+		result, now, jobID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE runners SET status = 'idle' WHERE id = (SELECT runner_id FROM jobs WHERE id = ?)`, jobID); err != nil {
+		return err
+	}
+	if err := propagate(ctx, tx, runID, now); err != nil {
+		return err
+	}
+	if err := bumpTasksVersion(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// propagate walks the run's blocked jobs and moves each one forward once its
+// upstreams have settled.
+func propagate(ctx context.Context, tx *sql.Tx, runID int64, now string) error {
+	results := map[string]string{}
+	statuses := map[string]string{}
+	rows, err := tx.QueryContext(ctx, `SELECT job_key, status, result FROM jobs WHERE run_id = ?`, runID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var k, st, res string
+		if err := rows.Scan(&k, &st, &res); err != nil {
+			rows.Close()
+			return err
+		}
+		statuses[k], results[k] = st, res
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	blocked, err := tx.QueryContext(ctx, `SELECT id, job_key, needs FROM jobs WHERE run_id = ? AND status = 'blocked'`, runID)
+	if err != nil {
+		return err
+	}
+	type pending struct {
+		id    int64
+		needs []string
+	}
+	var list []pending
+	for blocked.Next() {
+		var id int64
+		var key, needsRaw string
+		if err := blocked.Scan(&id, &key, &needsRaw); err != nil {
+			blocked.Close()
+			return err
+		}
+		list = append(list, pending{id: id, needs: decodeStrings(needsRaw)})
+	}
+	blocked.Close()
+	if err := blocked.Err(); err != nil {
+		return err
+	}
+
+	for _, p := range list {
+		ready, doomed := true, false
+		for _, n := range p.needs {
+			if statuses[n] != "done" {
+				ready = false
+				break
+			}
+			if r := results[n]; r == "failure" || r == "cancelled" {
+				doomed = true
+			}
+		}
+		if !ready {
+			continue
+		}
+		if doomed {
+			// An upstream failed. Skipping is the GitHub-compatible result and
+			// it beats leaving the job blocked until a human notices.
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE jobs SET status = 'done', result = 'skipped', stop_reason = 'upstream_failed',
+				                stopped_at = ? WHERE id = ?`, now, p.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET status = 'queued' WHERE id = ?`, p.id); err != nil {
+			return err
+		}
+	}
+
+	// Settle the run once nothing is left in flight.
+	var open int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id = ? AND status != 'done'`, runID).Scan(&open); err != nil {
+		return err
+	}
+	if open > 0 {
+		return nil
+	}
+	var failed, cancelled int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id = ? AND result = 'failure'`, runID).Scan(&failed); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id = ? AND result = 'cancelled'`, runID).Scan(&cancelled); err != nil {
+		return err
+	}
+	result := "success"
+	switch {
+	case failed > 0:
+		result = "failure"
+	case cancelled > 0:
+		result = "cancelled"
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE runs SET status = 'done', result = ?, stopped_at = ? WHERE id = ?`, result, now, runID)
+	return err
+}
+
+// ------------------------------------------------------------------ stops --
+
+// RequestStop records the ask. It does not stop anything by itself: the runner
+// learns about it on its next heartbeat and is expected to wind down and ack.
+func (s *Store) RequestStop(ctx context.Context, jobID int64, by, reason string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE jobs SET stop_requested_at = COALESCE(stop_requested_at, ?), stop_requested_by = ?, stop_reason = ?
+		WHERE id = ? AND status IN ('queued', 'running', 'blocked')`,
+		ts(s.now()), by, reason, jobID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// AckStop records that the runner confirmed it wound down and ran its cleanup.
+// This is the half the upstream proto has no room for, and its absence is what
+// turns a stop into a request nobody answers.
+func (s *Store) AckStop(ctx context.Context, jobID int64, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE jobs SET stop_acked_at = COALESCE(stop_acked_at, ?), cleanup_ran = 1 WHERE id = ?`,
+		ts(at), jobID)
+	return err
+}
+
+// ForceTerminate gives up waiting for an ack. The job is marked cancelled with
+// cleanup_ran left at 0, so the ledger says plainly that whatever the job was
+// holding was never released.
+func (s *Store) ForceTerminate(ctx context.Context, jobID int64, reason string) error {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE jobs SET force_terminated = 1, stop_reason = CASE WHEN stop_reason = '' THEN ? ELSE stop_reason END
+		WHERE id = ?`, reason, jobID); err != nil {
+		return err
+	}
+	return s.FinishJob(ctx, jobID, "cancelled")
+}
+
+// StopPending reports whether a stop has been asked for and not yet acked.
+func (s *Store) StopPending(ctx context.Context, jobID int64) (bool, error) {
+	var req, ack sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT stop_requested_at, stop_acked_at FROM jobs WHERE id = ?`, jobID).Scan(&req, &ack)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	return req.Valid && req.String != "" && (!ack.Valid || ack.String == ""), nil
+}
+
+// ------------------------------------------------------------------- logs --
+
+// AppendLogs stores a contiguous window of lines and returns the new ack index.
+//
+// Lines at or before the current ack are dropped as duplicates — a runner that
+// retries after a lost reply must not double-write. A gap (index beyond ack)
+// is refused by returning the unchanged ack, which tells the runner to rewind.
+func (s *Store) AppendLogs(ctx context.Context, jobID, index int64, rows []LogLine, noMore bool) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var ack int64
+	err = tx.QueryRowContext(ctx, `SELECT ack_index FROM job_log_state WHERE job_id = ?`, jobID).Scan(&ack)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_log_state (job_id, ack_index) VALUES (?, 0)`, jobID); err != nil {
+			return 0, err
+		}
+		ack = 0
+	} else if err != nil {
+		return 0, err
+	}
+
+	if index > ack {
+		// The runner skipped ahead; refuse and let it resend from ack.
+		return ack, nil
+	}
+	for i, row := range rows {
+		at := index + int64(i)
+		if at < ack {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO job_logs (job_id, idx, ts, content) VALUES (?, ?, ?, ?)
+			ON CONFLICT (job_id, idx) DO NOTHING`, jobID, at, ts(row.Time), row.Content); err != nil {
+			return 0, err
+		}
+		ack = at + 1
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE job_log_state SET ack_index = ?, no_more = ? WHERE job_id = ?`,
+		ack, boolInt(noMore), jobID); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return ack, nil
+}
+
+// LogLine is one stored log row.
+type LogLine struct {
+	Time    time.Time
+	Content string
+}
+
+// Logs returns a job's stored log lines in order.
+func (s *Store) Logs(ctx context.Context, jobID int64) ([]LogLine, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT ts, content FROM job_logs WHERE job_id = ? ORDER BY idx ASC`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LogLine
+	for rows.Next() {
+		var t, c string
+		if err := rows.Scan(&t, &c); err != nil {
+			return nil, err
+		}
+		parsed, _ := time.Parse(time.RFC3339Nano, t)
+		out = append(out, LogLine{Time: parsed, Content: c})
+	}
+	return out, rows.Err()
+}
+
+// ----------------------------------------------------------------- reaper --
+
+// OverdueJob is a running job past its timeout or a job whose stop was never
+// acknowledged.
+type OverdueJob struct {
+	ID              int64
+	Reason          string // timeout | stop_unacked
+	StopRequestedAt *time.Time
+}
+
+// Overdue finds jobs the reaper should act on. graceSeconds is how long a
+// runner gets to ack a stop before we force-terminate it.
+func (s *Store) Overdue(ctx context.Context, graceSeconds int) ([]OverdueJob, error) {
+	now := s.now().UTC()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, timeout_minutes, started_at, stop_requested_at, stop_acked_at
+		FROM jobs WHERE status = 'running'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OverdueJob
+	for rows.Next() {
+		var id int64
+		var timeout int
+		var started, stopReq, stopAck sql.NullString
+		if err := rows.Scan(&id, &timeout, &started, &stopReq, &stopAck); err != nil {
+			return nil, err
+		}
+		req, ack := parseTS(stopReq), parseTS(stopAck)
+		if req != nil && ack == nil && now.Sub(*req) > time.Duration(graceSeconds)*time.Second {
+			out = append(out, OverdueJob{ID: id, Reason: "stop_unacked", StopRequestedAt: req})
+			continue
+		}
+		if st := parseTS(started); st != nil && now.Sub(*st) > time.Duration(timeout)*time.Minute {
+			out = append(out, OverdueJob{ID: id, Reason: "timeout"})
+		}
+	}
+	return out, rows.Err()
+}
+
+// ------------------------------------------------------------------ views --
+
+// RunSummary is a run plus its job results, for the CLI.
+type RunSummary struct {
+	Run  Run
+	Jobs []Job
+}
+
+// ListRuns returns the most recent runs.
+func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at
+		FROM runs ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Run
+	for rows.Next() {
+		var r Run
+		var created string
+		if err := rows.Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile, &r.Event, &r.Ref, &r.SHA,
+			&r.Actor, &r.Status, &r.Result, &created); err != nil {
+			return nil, err
+		}
+		r.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RunByID returns a run with its jobs.
+func (s *Store) RunByID(ctx context.Context, id int64) (*RunSummary, error) {
+	var r Run
+	var created string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at
+		FROM runs WHERE id = ?`, id).Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile, &r.Event,
+		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, job_key, name, needs, runs_on, payload, status, result, timeout_minutes,
+		       runner_id, started_at, stopped_at, stop_requested_at, stop_reason, stop_acked_at,
+		       force_terminated, cleanup_ran
+		FROM jobs WHERE run_id = ? ORDER BY id ASC`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, *j)
+	}
+	return &RunSummary{Run: r, Jobs: jobs}, rows.Err()
+}
+
+// MarshalNeeds is a helper for building the needs context payload.
+func MarshalNeeds(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+var _ = fmt.Sprintf

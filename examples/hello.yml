@@ -1,0 +1,43 @@
+name: Orrery Smoke
+
+on:
+  push:
+    branches: [main]
+
+env:
+  GREETING: hello
+
+jobs:
+  build:
+    name: Build
+    runs-on: [self-hosted]
+    steps:
+      - name: Say hello
+        run: |
+          echo "$GREETING from orrery"
+          echo "pwd is $(pwd)"
+      - name: Do some work
+        run: |
+          for i in 1 2 3; do echo "step $i"; done
+
+  test:
+    name: Test
+    needs: build
+    runs-on: [self-hosted]
+    timeout-minutes: 5
+    steps:
+      - name: Run tests
+        run: echo "tests pass"
+
+  lint:
+    name: Lint
+    needs: build
+    steps:
+      - name: Lint
+        run: echo "lint clean"
+
+  report:
+    name: Report
+    needs: [test, lint]
+    steps:
+      - run: echo "all green"

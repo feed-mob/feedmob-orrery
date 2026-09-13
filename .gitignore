@@ -3,3 +3,8 @@ node_modules/
 *.log
 tmp/
 .work/
+bin/
+*.db
+*.db-wal
+*.db-shm
+orrery-runner.json
