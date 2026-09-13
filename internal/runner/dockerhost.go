@@ -24,9 +24,9 @@ func ResolveDockerHost() string {
 	home, _ := os.UserHomeDir()
 	candidates := []string{
 		"/var/run/docker.sock",
-		filepath.Join(home, ".docker/run/docker.sock"),  // Docker Desktop
+		filepath.Join(home, ".docker/run/docker.sock"),     // Docker Desktop
 		filepath.Join(home, ".colima/default/docker.sock"), // Colima
-		filepath.Join(home, ".rd/docker.sock"),          // Rancher Desktop
+		filepath.Join(home, ".rd/docker.sock"),             // Rancher Desktop
 	}
 	for _, path := range candidates {
 		if dialable(path) {
