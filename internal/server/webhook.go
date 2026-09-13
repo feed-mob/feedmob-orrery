@@ -373,9 +373,19 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Resolve the ref to a commit. A dispatched run otherwise has no
+	// `github.sha`: actions/checkout copes by using the ref, but a reusable
+	// workflow resolves as `owner/repo/path@sha` and fails with "reference not
+	// found", and a commit status has nothing to attach to.
+	sha, err := s.forge.ResolveRef(ctx, req.Repo, ref)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, fmt.Sprintf("cannot resolve %s@%s: %v", req.Repo, ref, err))
+		return
+	}
 	run := store.Run{
 		Repo: req.Repo, WorkflowName: wf.Name, WorkflowFile: file.Path,
-		Event: "workflow_dispatch", Ref: ref, Actor: orDefault(req.Actor, "api"),
+		Event: "workflow_dispatch", Ref: refName(ref), SHA: sha,
+		Actor:        orDefault(req.Actor, "api"),
 		EventPayload: string(payload),
 	}
 	if err := s.applyConcurrency(wf, &run); err != nil {
@@ -402,4 +412,14 @@ func inputNames(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// refName normalises what someone typed into the ref a workflow will see.
+// "main" and "refs/heads/main" mean the same branch; the github context and the
+// `branches:` filters both expect the long form.
+func refName(ref string) string {
+	if ref == "" || ref == "HEAD" || strings.HasPrefix(ref, "refs/") {
+		return ref
+	}
+	return "refs/heads/" + ref
 }

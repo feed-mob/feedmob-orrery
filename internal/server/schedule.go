@@ -122,10 +122,16 @@ func (s *Server) startScheduled(ctx context.Context, sc store.Schedule) (int64, 
 	if err != nil {
 		return 0, err
 	}
+	// Same reason as a dispatched run: a scheduled one carries a branch and no
+	// commit, and `github.sha` being empty surfaces three layers down.
+	sha, err := s.forge.ResolveRef(ctx, sc.Repo, sc.Ref)
+	if err != nil {
+		return 0, fmt.Errorf("resolve %s@%s: %w", sc.Repo, sc.Ref, err)
+	}
 	payload, _ := json.Marshal(map[string]any{"schedule": sc.Cron, "repository": map[string]any{"full_name": sc.Repo}})
 	run := store.Run{
 		Repo: sc.Repo, WorkflowName: wf.Name, WorkflowFile: file.Path,
-		Event: "schedule", Ref: "refs/heads/" + sc.Ref, Actor: "orrery",
+		Event: "schedule", Ref: "refs/heads/" + sc.Ref, SHA: sha, Actor: "orrery",
 		EventPayload: string(payload),
 	}
 	if err := s.applyConcurrency(wf, &run); err != nil {

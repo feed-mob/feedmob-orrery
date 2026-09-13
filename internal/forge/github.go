@@ -103,6 +103,35 @@ func isWorkflowFile(name string) bool {
 	return strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml")
 }
 
+// ResolveRef turns a branch, tag or sha into the commit sha it names.
+//
+// A run started by a person or a cron carries a ref and no commit, and plenty
+// downstream needs the commit: `github.sha`, a reusable workflow resolved as
+// `owner/repo/path@sha`, a commit status with nowhere to attach. Leaving it
+// empty does not fail loudly — it fails as "reference not found" somewhere
+// three layers down.
+func (c *Client) ResolveRef(ctx context.Context, repo, ref string) (string, error) {
+	if ref == "" {
+		ref = "HEAD"
+	}
+	body, status, err := c.get(ctx,
+		fmt.Sprintf("%s/repos/%s/commits/%s", c.apiURL, repo, url.PathEscape(ref)),
+		// This media type asks for the bare sha rather than the whole commit,
+		// which is a few hundred bytes instead of a few kilobytes.
+		"application/vnd.github.sha")
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("resolve %s@%s: %s: %s", repo, ref, http.StatusText(status), snippet(body))
+	}
+	sha := strings.TrimSpace(string(body))
+	if len(sha) < 7 {
+		return "", fmt.Errorf("resolve %s@%s: got %q", repo, ref, sha)
+	}
+	return sha, nil
+}
+
 // State is a commit status state, in GitHub's vocabulary.
 type State string
 

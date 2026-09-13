@@ -43,6 +43,11 @@ func (f *fakeForge) handler() http.Handler {
 		}
 		_, _ = io.WriteString(w, f.workflow)
 	})
+	// Resolving a ref to a commit: a dispatched or scheduled run carries a
+	// branch and needs the sha that branch points at.
+	mux.HandleFunc("GET /repos/{owner}/{repo}/commits/{ref}", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "beefcafebeefcafebeefcafebeefcafebeefcafe")
+	})
 	mux.HandleFunc("POST /repos/{owner}/{repo}/statuses/{sha}", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)

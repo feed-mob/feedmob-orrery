@@ -97,3 +97,67 @@ func TestSetCommitStatusSurfacesAForgeRejection(t *testing.T) {
 		t.Fatalf("err = %v, want the forge's own message", err)
 	}
 }
+
+// A run started by a person or a cron carries a ref and no commit. Leaving the
+// sha empty does not fail loudly — it fails as "reference not found" three
+// layers down, inside a reusable workflow resolution.
+func TestResolveRef(t *testing.T) {
+	var asked string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = r.URL.Path
+		if r.Header.Get("Accept") != "application/vnd.github.sha" {
+			t.Errorf("Accept = %q; asking for the whole commit wastes a few KB per run",
+				r.Header.Get("Accept"))
+		}
+		_, _ = io.WriteString(w, "beefcafebeefcafebeefcafebeefcafebeefcafe\n")
+	}))
+	defer srv.Close()
+
+	sha, err := New(srv.URL, "t").ResolveRef(context.Background(), "o/r", "main")
+	if err != nil {
+		t.Fatalf("ResolveRef: %v", err)
+	}
+	if sha != "beefcafebeefcafebeefcafebeefcafebeefcafe" {
+		t.Errorf("sha = %q", sha)
+	}
+	if asked != "/repos/o/r/commits/main" {
+		t.Errorf("asked %q", asked)
+	}
+}
+
+// A ref with a slash — release/2026-09 — must not break the path.
+func TestResolveRefEscapesTheRef(t *testing.T) {
+	var asked string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = r.URL.EscapedPath()
+		_, _ = io.WriteString(w, "beefcafebeefcafebeefcafebeefcafebeefcafe")
+	}))
+	defer srv.Close()
+	if _, err := New(srv.URL, "t").ResolveRef(context.Background(), "o/r", "release/2026-09"); err != nil {
+		t.Fatalf("ResolveRef: %v", err)
+	}
+	if !strings.Contains(asked, "release%2F2026-09") {
+		t.Errorf("escaped path = %q, want the slash escaped", asked)
+	}
+}
+
+func TestResolveRefSurfacesAMissingRef(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "No commit found for SHA", http.StatusNotFound)
+	}))
+	defer srv.Close()
+	if _, err := New(srv.URL, "t").ResolveRef(context.Background(), "o/r", "nope"); err == nil {
+		t.Fatal("a missing ref resolved successfully")
+	}
+}
+
+// A body that is not a sha must be refused rather than passed on as one.
+func TestResolveRefRejectsNonsense(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	if _, err := New(srv.URL, "t").ResolveRef(context.Background(), "o/r", "main"); err == nil {
+		t.Fatal("accepted a two-character body as a commit sha")
+	}
+}
