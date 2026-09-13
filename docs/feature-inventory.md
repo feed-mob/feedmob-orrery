@@ -34,22 +34,29 @@ P0 的骨架与执行器都已跑通，以下条目**已验证可用**，不再�
 | 67 | 幂等键 | webhook delivery id |
 
 | 10 | job 级 `if:` | `examples/conditional.yml`：build 失败后 deploy skipped、`if: always()` 的 notify 与 `if: failure()` 的 rollback 都跑了 |
-
 | 17 | 并发组 | `concurrency` / `cancel-in-progress`，且**平台默认开启**（GitHub 有但默认关，正是 #17 要改的那条） |
-
 | 2 | 定时触发 | `on: schedule`，从默认分支注册；重叠由并发组接管 |
 | 3 | 带参手动触发 | `workflow_dispatch` inputs，run 创建前校验；`orrery dispatch` |
 | 4 53 | API 触发与管理 API | `POST /api/dispatch`、`/api/runs`、`/api/webhooks/github` |
-
 | 32 | Web UI | 编译进二进制、无 CDN；run 列表、步骤时间线、日志、重跑、停止 |
 | 50 | 运行通知 | 变化才发（失败 / 恢复），作用域 repo+workflow+ref |
 | 53 | 重跑 | `rerun [--failed]`，run 不变 attempt +1；日志按 attempt 归档，旧的不被覆盖 |
 
-**P0 的触发—执行—回写闭环到此完整。** 剩下的 P0 级缺口只有 `permissions:` 收窄 token（#45），
-它需要先有 GitHub App 才能铸造收窄的凭据，是部署决策而不是代码缺口。
+| 29 | 密钥日志打码 | `secrets.*` 与 `::add-mask::` 的值在 runner 侧打码后才入库（act 在 formatter 里打码，hook 拿到的是原文） |
+| 73 | 认证（非 RBAC） | 无 `-api-token` 拒绝启动；bearer / HttpOnly 会话 cookie；`-repos` 仓库白名单 |
+| — | 日志容量上限 | 每 job 每 attempt 默认 64MB；超限确认并丢弃，留一行说明 |
+
+**P0 的触发—执行—回写闭环完整，P1 的重跑 / 面板 / 通知 / 认证也已落地。**
+剩下的 P0 级缺口只有 `permissions:` 收窄 token（#45），它需要先有 GitHub App
+才能铸造收窄的凭据，是部署决策而不是代码缺口。
+
+**P1 还没做的**：中心化产物存储（多 runner 才需要）、自建 runner 池（#15，偏运维）、
+限流去抖（#68）、成本预算（#21）、真正的 RBAC（#73，共享令牌没有"谁"）。
 
 **已知边界**（见 README）：`GITHUB_API_URL` 对 github.com 是错的（`gitea/runner` v1.0.8 硬编码 Gitea 的 API 形状，无配置开关）；
-host 模式的 job 继承 runner 进程的环境变量；产物与缓存 action 必须钉 `@v3`，且属于产生它的那台 runner。
+host 模式的 job 继承 runner 进程的环境变量、且不一定停得下来（要用容器）；
+产物与缓存 action 必须钉 `@v3`，且属于产生它的那台 runner；容器步骤在 Colima 上偶发卡住，
+兜底是两层超时。
 
 ---
 
