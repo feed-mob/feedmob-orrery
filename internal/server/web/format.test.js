@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   toneOf, verdict, duration, ago, shortRef, classify, splitStamp, groupLines, countMatches,
+  machineTime, share,
 } from './format.js';
 
 test('颜色跟的是结论，不是状态', () => {
@@ -121,4 +122,22 @@ test('十万行也要在合理时间内折叠完', () => {
   const out = groupLines(lines);
   assert.equal(out.length, 100000);
   assert.ok(Date.now() - t0 < 3000, `groupLines 花了 ${Date.now() - t0}ms`);
+});
+
+test('machineTime 的单位跟着量级走', () => {
+  assert.equal(machineTime(0), '0');
+  // 毫秒级的 job 不该被舍成 0——"0 分"会让人不再相信这一页
+  assert.equal(machineTime(12), '12 毫秒');
+  assert.equal(machineTime(1500), '1.5 秒');
+  assert.equal(machineTime(90000), '1.5 分');
+  assert.equal(machineTime(3600000), '60 分');
+  // 10 分钟以上不再给小数——精度在这里不帮人做决定
+  assert.equal(machineTime(630000), '11 分');
+});
+
+test('share 不会越界', () => {
+  assert.equal(share(50, 100), 50);
+  assert.equal(share(0, 0), 0);
+  assert.equal(share(200, 100), 100);
+  assert.equal(share(-5, 100), 0);
 });

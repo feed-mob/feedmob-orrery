@@ -38,7 +38,14 @@ func main() {
 			"token every human-facing API call and the dashboard must present")
 		noAuth = flag.Bool("insecure-no-auth", false,
 			"serve the API and dashboard with no authentication; anyone who can reach the port can run arbitrary workflows with this server's secrets")
-		retention = flag.Duration("retention", 30*24*time.Hour,
+		allowedActions = flag.String("allowed-actions", os.Getenv("ORRERY_ALLOWED_ACTIONS"),
+			"comma-separated `uses:` patterns a workflow may pull in (actions/*, feed-mob/*, or an exact owner/repo@ref); empty allows everything")
+		requireSHA = flag.Bool("require-action-sha", false,
+			"refuse a `uses:` pinned to a tag or branch; a tag is a name someone else can move (tj-actions, 2025-03)")
+		rateLimit = flag.Int("rate-limit", 60,
+			"most webhook deliveries one repository may turn into runs per -rate-window; 0 disables the cap")
+		rateWindow = flag.Duration("rate-window", time.Minute, "the window -rate-limit counts over")
+		retention  = flag.Duration("retention", 30*24*time.Hour,
 			"how long a finished run and its logs are kept; 0 keeps everything")
 		repos = flag.String("repos", os.Getenv("ORRERY_REPOS"),
 			"comma-separated owner/repo this server will build; empty means any repository a signed webhook names")
@@ -113,6 +120,9 @@ func main() {
 		NotifyWebhook:      *notifyHook,
 		APIToken:           *apiToken,
 		Repos:              splitList(*repos),
+		Actions:            server.ActionPolicy{Allow: splitList(*allowedActions), RequireSHA: *requireSHA},
+		RateLimit:          *rateLimit,
+		RateWindow:         *rateWindow,
 		Retention:          *retention,
 	}, log)
 
@@ -151,6 +161,10 @@ func main() {
 	}
 	if *forgeToken == "" {
 		log.Warn("no forge token: results will not be reported back to the forge")
+	}
+	if *allowedActions == "" && !*requireSHA {
+		log.Warn("no -allowed-actions: a workflow may pull in any third-party action, " +
+			"on a runner that holds this server's secrets")
 	}
 	if *repos == "" {
 		log.Warn("no -repos list: any repository a signed webhook names will be built with this " +

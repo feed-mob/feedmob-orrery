@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestDeploymentLedger(t *testing.T) {
@@ -174,5 +175,71 @@ func TestRollbackSkipsTheVersionAlreadyLive(t *testing.T) {
 	cur, _ := st2.CurrentDeployments(ctx, "r")
 	if _, err := st2.LastGoodDeployment(ctx, "r", "production", cur[0].ID, "v1"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("a single-version history offered a rollback target: %v", err)
+	}
+}
+
+// The charter's P1 is "take the bill back from GitHub", and that is not a
+// conversation anyone can have without knowing which workflow spends the time.
+func TestUsageSince(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := newRunner(t, st, []string{"self-hosted"}, nil)
+
+	run := func(repo, wfName string, results ...string) {
+		id, err := st.CreateRun(ctx, Run{Repo: repo, WorkflowName: wfName},
+			[]NewJob{{Key: "a", Payload: "p", RunsOn: []string{"self-hosted"}}})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		sum, _ := st.RunByID(ctx, id)
+		job, err := st.ClaimJob(ctx, r)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		_ = sum
+		// Give it a measurable duration.
+		if _, err := st.db.ExecContext(ctx,
+			`UPDATE jobs SET started_at = ?, stopped_at = ? WHERE id = ?`,
+			ts(time.Now().UTC().Add(-time.Minute)), ts(time.Now().UTC()), job.ID); err != nil {
+			t.Fatalf("times: %v", err)
+		}
+		if _, err := st.FinishJob(ctx, job.ID, results[0]); err != nil {
+			t.Fatalf("finish: %v", err)
+		}
+	}
+	run("feed-mob/app", "Deploy", "success")
+	run("feed-mob/app", "Deploy", "failure")
+	run("feed-mob/other", "CI", "success")
+
+	usage, err := st.UsageSince(ctx, time.Now().UTC().AddDate(0, 0, -1))
+	if err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+	got := map[string]Usage{}
+	for _, u := range usage {
+		got[u.Repo+"/"+u.WorkflowName] = u
+	}
+	deploy := got["feed-mob/app/Deploy"]
+	if deploy.Runs != 2 || deploy.Jobs != 2 {
+		t.Errorf("Deploy = %+v, want 2 runs and 2 jobs", deploy)
+	}
+	if deploy.Failed != 1 {
+		t.Errorf("Deploy failures = %d, want 1", deploy.Failed)
+	}
+	// A minute each, so roughly two minutes — not exact, the clock moved.
+	if deploy.Millis < 100_000 || deploy.Millis > 130_000 {
+		t.Errorf("Deploy millis = %d, want about 120000", deploy.Millis)
+	}
+	if got["feed-mob/other/CI"].Runs != 1 {
+		t.Errorf("the other repository was merged in: %+v", got)
+	}
+
+	// A window that excludes everything reports nothing rather than everything.
+	empty, err := st.UsageSince(ctx, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("a future window returned %d rows", len(empty))
 	}
 }

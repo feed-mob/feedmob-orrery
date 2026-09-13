@@ -217,3 +217,59 @@ func (s *Store) Schedules(ctx context.Context) ([]Schedule, error) {
 	}
 	return out, rows.Err()
 }
+
+// Usage is how much machine time a slice of work consumed.
+//
+// Minutes rather than a currency: what a minute costs depends on where the
+// runner runs, and a number that pretends to be dollars while nobody has told
+// it the machine's price is worse than no number. Multiply outside.
+type Usage struct {
+	Repo         string
+	WorkflowName string
+	Runs         int
+	Jobs         int
+	// Millis is wall-clock across jobs. Jobs of one run overlap, so this is
+	// machine time consumed, not how long anyone waited.
+	//
+	// Milliseconds because whole seconds round a fast job to zero, and a page
+	// reporting "0 minutes" for five runs is a page nobody believes again.
+	Millis int64
+	Failed int
+}
+
+// UsageSince aggregates finished jobs by repository and workflow.
+//
+// The charter's P1 is "take the bill back from GitHub", and that is not a
+// conversation anyone can have without knowing which workflow spends the time.
+// Ours is usually one or two of them.
+func (s *Store) UsageSince(ctx context.Context, since time.Time) ([]Usage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT r.repo, r.workflow_name,
+		       COUNT(DISTINCT r.id) AS runs,
+		       COUNT(j.id)          AS jobs,
+		       -- julianday rather than strftime('%s'): whole seconds round a
+		       -- fast job to zero, and enough of those makes a busy workflow
+		       -- look free. COALESCE keeps a job that never started from
+		       -- poisoning the sum with NULL.
+		       COALESCE(SUM(MAX(0,
+		           CAST((julianday(j.stopped_at) - julianday(j.started_at)) * 86400000 AS INTEGER))), 0),
+		       COALESCE(SUM(CASE WHEN j.result = 'failure' THEN 1 ELSE 0 END), 0)
+		FROM jobs j JOIN runs r ON r.id = j.run_id
+		WHERE j.status = 'done' AND j.started_at IS NOT NULL AND j.stopped_at IS NOT NULL
+		      AND j.stopped_at >= ?
+		GROUP BY r.repo, r.workflow_name
+		ORDER BY 5 DESC`, ts(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Usage
+	for rows.Next() {
+		var u Usage
+		if err := rows.Scan(&u.Repo, &u.WorkflowName, &u.Runs, &u.Jobs, &u.Millis, &u.Failed); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}

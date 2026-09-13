@@ -71,6 +71,13 @@ type Config struct {
 	// which is the wrong default for anything long-lived: a repository
 	// building twenty times a day keeps every log line forever.
 	Retention time.Duration
+	// Actions decides which third-party `uses:` a run may pull in. The empty
+	// policy allows everything.
+	Actions ActionPolicy
+	// RateLimit caps how many runs one repository may start per RateWindow.
+	// Zero means no cap.
+	RateLimit  int
+	RateWindow time.Duration
 	// Repos limits which repositories this server will build. Empty means all.
 	Repos []string
 	// NotifyWebhook receives a message when a workflow's verdict changes.
@@ -144,6 +151,7 @@ type Server struct {
 	wake     *notifier
 	forge    *forge.Client
 	notifier *notify.Webhook
+	limiter  *throttle
 }
 
 // New builds a server.
@@ -153,6 +161,7 @@ func New(st *store.Store, cfg Config, log *slog.Logger) *Server {
 		st: st, cfg: cfg, log: log, mux: http.NewServeMux(), wake: newNotifier(),
 		forge:    forge.New(cfg.Forge.APIURL, cfg.ForgeToken),
 		notifier: notify.New(cfg.NotifyWebhook),
+		limiter:  newThrottle(cfg.RateLimit, cfg.RateWindow),
 	}
 	s.routes()
 	return s
@@ -185,6 +194,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/workflows", s.operator(s.handleWorkflowsOf))
 	s.mux.HandleFunc("GET /api/config", s.operator(s.handleConfig))
 	s.mux.HandleFunc("POST /api/runs/{id}/cancel", s.operator(s.handleCancelRun))
+	s.mux.HandleFunc("GET /api/usage", s.operator(s.handleUsage))
 	s.mux.HandleFunc("GET /api/deployments", s.operator(s.handleDeployments))
 	s.mux.HandleFunc("POST /api/deployments/rollback", s.operator(s.handleRollback))
 	s.mux.HandleFunc("GET /api/runs/{id}", s.operator(s.handleGetRun))

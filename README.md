@@ -166,6 +166,9 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **仓库白名单** | ✅ `-repos`；签名不等于"这个仓库归我们管" |
 | **API / UI 认证** | ✅ 无 token 拒绝启动；bearer / HttpOnly 会话 cookie；webhook 走签名、healthz 开放 |
 | **Web UI**（#32） | ✅ 编译进二进制，无 CDN；run 列表、步骤时间线、日志、重跑、停止；深色与手机适配 |
+| **用量统计**（#51） | ✅ 按仓库 × workflow 的机器时间、run 数、失败数；毫秒精度 |
+| **限流**（#68） | ✅ 每仓库每窗口的投递上限，默认 60/分钟 |
+| **action 白名单**（#46） | ✅ `-allowed-actions`、`-require-action-sha`；入队前就拒 |
 | **部署台账与回滚**（#58 #59 #60） | ✅ `environment:` 记账；一键回滚（跳过当前版本、连按会一直往回走）；`auto-rollback` |
 | **`workflow_run` 链式触发**（#37） | ✅ 一个 workflow 落定后触发另一个；只跳一跳，不会成环 |
 | **自动重试**（#66） | ✅ job 级 `retry:`，指数退避；GitHub 完全没有这个 |
@@ -319,6 +322,40 @@ GitHub App，再升级到 Checks API 拿 diff 行内注解。
 那几行，不是每两秒把整份日志重新拉一遍。渲染上限 5000 行，超出给「纯文本」链接。
 
 只在有东西真的在动的时候才轮询——没人看的时候还在敲自己控制面的面板，本身就是一次故障。
+
+### 供应链：action 白名单
+
+```
+-allowed-actions 'actions/*,feed-mob/*'
+-require-action-sha          # 拒绝钉在 tag 或分支上的 uses:
+```
+
+不设的话，这台服务器构建的任何 workflow 都能在一台握着部署密钥的 runner 上跑任意
+第三方代码。tj-actions/changed-files 在 2025-03 就是这么出事的：一个可变 tag 被重新
+指向，所有跟着它的 workflow 在下一次运行时开始泄露密钥。
+
+**在入队之前就拒。** 一个注定要被拦下的 run 不该先占住一台 runner、检出仓库、拿到密钥。
+`./` 本地 action 和 `docker://` 容器不在管辖范围——那是仓库自己的代码。
+`-require-action-sha` 只认完整 40 位 commit：缩写 sha 在 GitHub 上会先按 tag 解析，
+可变的名字又回来了。
+
+### 限流
+
+`-rate-limit 60 -rate-window 1m`（默认值）。一次碰了四十个分支的 force-push 会变成四十个
+排队的 run，整个 runner 池接下来一小时都在做没人想要的事。并发组只管同组的 run 串行，
+管不了四十个不同 workflow 的四十个 run。
+
+有意做成**"开始"的上限而不是队列**：被拒的投递 GitHub 会重投，而一个反正要被取代的 run
+不如根本别创建。把什么都收进队列回头再说，正是队列变成故障的方式。
+
+### 用量统计
+
+面板「用量」页：按仓库 × workflow 的机器时间、run 数、失败数，7/30/90 天窗口。
+
+**是分钟不是钱。** 一分钟值多少取决于 runner 跑在哪，一个没人告诉过它机器价格却装成
+美元的数字，比没有数字更糟。要算钱，在外面乘。
+
+精度到毫秒：整秒会把快 job 舍成 0，而一页给 5 个 run 报"0 分"之后就没人会再信它。
 
 ### 部署台账与回滚
 

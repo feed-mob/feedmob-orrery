@@ -5,6 +5,7 @@
 
 import {
   toneOf, verdict, duration, ago, shortRef, classify, splitStamp, groupLines, countMatches,
+  machineTime, share,
 } from './format.js';
 
 const app = document.getElementById('app');
@@ -107,6 +108,7 @@ function renderNav(active) {
   const items = [
     ['#/', 'RUNS'],
     ['#/deployments', '部署'],
+    ['#/usage', '用量'],
     ['#/runners', 'RUNNERS'],
     ['#/schedules', '定时'],
   ];
@@ -539,6 +541,61 @@ async function renderDeployments() {
   return current;
 }
 
+// ----------------------------------------------------------------- usage --
+
+// Minutes, not money: what a minute costs depends on where the runner runs, and
+// a number pretending to be dollars while nobody has told it the machine's
+// price is worse than no number.
+async function renderUsage() {
+  renderNav('#/usage');
+  crumb.textContent = '';
+  const days = Number(filtersFromHash().days) || 30;
+  const data = await api('/api/usage?days=' + days);
+  const rows = data.rows || [];
+
+  // Include whatever the URL asked for, even if it is not one of the presets:
+  // a picker that silently displays "7 days" while showing one day's data is
+  // the same lie as a form field whose value is not what gets submitted.
+  const choices = [...new Set([7, 30, 90, days])].sort((a, b) => a - b);
+  const picker = el('select', {
+    class: 'text narrow',
+    onchange: e => { location.hash = '#/usage?days=' + e.target.value; },
+  }, ...choices.map(d => el('option', {
+    value: d, selected: d === days ? 'selected' : null,
+  }, '最近 ' + d + ' 天')));
+
+  if (!rows.length) {
+    app.replaceChildren(card('用量',
+      el('div', { class: 'row pad' }, picker),
+      el('div', { class: 'empty' }, '这个窗口里没有跑完的 job。')));
+    return rows;
+  }
+  const body = rows.map(u => el('tr', {},
+    el('td', {}, u.WorkflowName || '(未命名)'),
+    el('td', { class: 'mono dim secondary' }, u.Repo),
+    el('td', { class: 'num mono' }, machineTime(u.Millis)),
+    el('td', {},
+      // The bar has already done the comparison a column of numbers asks you
+      // to do in your head.
+      el('div', { class: 'bar' },
+        el('div', { class: 'fill', style: `width:${share(u.Millis, data.total_millis).toFixed(1)}%` }))),
+    el('td', { class: 'num dim' }, u.Runs),
+    el('td', { class: 'num dim secondary' }, u.Jobs),
+    el('td', { class: 'num' }, u.Failed
+      ? el('span', { class: 'fail' }, u.Failed)
+      : el('span', { class: 'dim' }, '0'))));
+
+  app.replaceChildren(el('div', { class: 'card' },
+    el('h2', {}, '用量', el('span', { class: 'spacer' }),
+      el('span', { class: 'dim' },
+        `${machineTime(data.total_millis)} · ${data.total_runs} 个 run`)),
+    el('div', { class: 'row pad' }, picker,
+      el('span', { class: 'dim' }, '机器时间，不是钱——一分钟值多少取决于 runner 跑在哪')),
+    table(['WORKFLOW', ['仓库', 'secondary'], ['机器时间', 'num'], '占比',
+           ['RUN', 'num'], ['JOB', 'num secondary'], ['失败', 'num']], body)));
+  return rows;
+}
+
 // -------------------------------------------------------------- dispatch --
 
 async function renderDispatch() {
@@ -687,6 +744,7 @@ async function route() {
     const run = hash.match(/^#\/runs\/(\d+)/);
     if (run) live = await renderRun(Number(run[1]));
     else if (hash === '#/deployments') live = await renderDeployments();
+    else if (hash === '#/usage') live = await renderUsage();
     else if (hash === '#/runners') live = await renderRunners();
     else if (hash === '#/schedules') live = await renderSchedules();
     else if (hash === '#/dispatch') live = await renderDispatch();

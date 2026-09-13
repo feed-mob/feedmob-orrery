@@ -161,6 +161,12 @@ func (s *Server) prepare(ctx context.Context, wf *workflow.Workflow, run *store.
 		Vars:   s.cfg.Vars,
 		Inputs: anyMap(inputs),
 	}
+	// Refuse before anything is queued. A run that is going to be stopped for
+	// pulling in code we do not allow should not first occupy a runner, check
+	// out the repository and be handed the secrets.
+	if err := s.cfg.Actions.Check(wf.UsedActions()); err != nil {
+		return 0, err
+	}
 	if err := s.applyConcurrency(wf, run, env); err != nil {
 		return 0, err
 	}

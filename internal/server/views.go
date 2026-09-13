@@ -187,3 +187,31 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"auth_required": s.cfg.APIToken != "",
 	})
 }
+
+// handleUsage reports machine time by repository and workflow.
+//
+// Minutes, not money: what a minute costs depends on where the runner runs, and
+// a number pretending to be dollars while nobody has told it the machine's
+// price is worse than no number.
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+	if days <= 0 || days > 365 {
+		days = 30
+	}
+	usage, err := s.st.UsageSince(r.Context(), time.Now().UTC().AddDate(0, 0, -days))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var totalMillis int64
+	var totalRuns, totalJobs int
+	for _, u := range usage {
+		totalMillis += u.Millis
+		totalRuns += u.Runs
+		totalJobs += u.Jobs
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"days": days, "rows": usage,
+		"total_millis": totalMillis, "total_runs": totalRuns, "total_jobs": totalJobs,
+	})
+}

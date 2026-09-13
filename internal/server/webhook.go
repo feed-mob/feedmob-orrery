@@ -167,6 +167,15 @@ func (s *Server) dispatchEvent(ctx context.Context, event string, body []byte) (
 		return nil, fmt.Errorf("decode %s payload: %w", event, err)
 	}
 
+	// Checked once per delivery, not once per matching workflow: a push that
+	// matches five workflows is one event, and counting it five times would
+	// punish repositories for having more CI rather than for being noisy.
+	if ok, count := s.limiter.allow(p.Repository.FullName); !ok {
+		s.log.Warn("rate limit: dropping a delivery",
+			"repo", p.Repository.FullName, "event", event, "in_window", count)
+		return nil, nil
+	}
+
 	files, err := s.forge.Workflows(ctx, p.Repository.FullName, sha)
 	if err != nil {
 		return nil, fmt.Errorf("read workflows at %s: %w", sha, err)

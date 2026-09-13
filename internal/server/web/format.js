@@ -100,3 +100,22 @@ export function countMatches(lines, needle) {
   for (const l of lines) if (l.toLowerCase().includes(n)) count++;
   return count;
 }
+
+// machineTime renders a duration for the usage table. Milliseconds are what the
+// database has; a unit someone can compare is what the page needs, and that
+// changes with the magnitude — "0.0 分" for a job that took 12ms is the same
+// failure as reporting nothing.
+export function machineTime(ms) {
+  if (!ms) return '0';
+  if (ms < 1000) return ms + ' 毫秒';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + ' 秒';
+  const m = ms / 60000;
+  return (m < 10 ? m.toFixed(1) : String(Math.round(m))) + ' 分';
+}
+
+// share is a workflow's slice of the total, for the bar next to each row. A
+// table of numbers makes you do the comparison; a bar has already done it.
+export function share(seconds, total) {
+  if (!total) return 0;
+  return Math.max(0, Math.min(100, (seconds / total) * 100));
+}
