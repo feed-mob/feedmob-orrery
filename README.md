@@ -235,6 +235,13 @@ Gitea 的 API 形状（`<forge>/api/v1`，且把 `GITHUB_GRAPHQL_URL` 置空）�
 修它意味着把 act 那棵树接管过来自己维护，而不是继续跟上游——这是产品决策，不是补丁，
 见 charter 的 (a)/(b) 分工。
 
+**容器里的步骤偶发会卡住不返回。** 在本机（Colima）跑产物用例时见过一次：
+`actions/cache` 的 post 步骤已经打印完 "Cache saved successfully"，但 act 的
+`waitForCommand` 还在等 docker exec 的输出流关闭，流一直没关。栈在 act 的容器层，
+不在我们的代码里。**兜底是超时**——那个 job 写了 `timeout-minutes: 10`，回收器到点
+会请求停止、宽限期后强杀，并在台账里把 `cleanup_ran` 记成 0。这正是"超时 NOT NULL
+且有平台默认值"这条设计要防的情况：忘记写超时的 job 遇到这种卡死会永远占着 runner。
+
 **host 模式的 job 会继承 runner 进程的整个环境变量。** 这是 act host 模式的行为，
 GitHub 的 self-hosted runner 同样如此。默认标签里 `self-hosted:host` 是开着的，
 所以运行不可信代码的 runner 必须是独立主机——这正是 `agent-worker/README.md` 里那条规矩。
