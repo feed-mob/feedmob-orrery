@@ -1,26 +1,23 @@
 package runner
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/feed-mob/feedmob-orrery/internal/protocol"
-	"github.com/feed-mob/feedmob-orrery/internal/workflow"
 )
 
 // Options configure a runner.
 type Options struct {
 	Name   string
-	Labels []string
-	// WorkDir is where job working directories are created.
+	Labels Labels
+	// WorkDir is where job workspaces and the action cache live.
 	WorkDir string
 	// HeartbeatInterval is how often a running task reports in. The reply to
 	// the heartbeat is also how a stop request reaches us, so this doubles as
@@ -28,6 +25,18 @@ type Options struct {
 	HeartbeatInterval time.Duration
 	// LogFlushInterval bounds how long a line waits before shipping.
 	LogFlushInterval time.Duration
+	// ActionsURL is where `uses: owner/repo@ref` resolves from. Pointing this
+	// at a mirror instead of github.com is the whole of OQ-4.
+	ActionsURL string
+	// ActionsOffline serves only already-cached actions and refuses fetches.
+	ActionsOffline bool
+	// DockerHost is the daemon container jobs run on. Empty means probe the
+	// conventional locations.
+	DockerHost string
+	// MountDockerSocket bind-mounts that daemon into every job container, so a
+	// step can run `docker`. It is an escape hatch out of the job's own
+	// sandbox, so it is off unless an operator asks for it.
+	MountDockerSocket bool
 }
 
 func (o *Options) withDefaults() {
@@ -40,10 +49,16 @@ func (o *Options) withDefaults() {
 	if o.WorkDir == "" {
 		o.WorkDir = filepath.Join(os.TempDir(), "orrery-work")
 	}
+	if o.ActionsURL == "" {
+		o.ActionsURL = "https://github.com"
+	}
+	if o.DockerHost == "" {
+		o.DockerHost = ResolveDockerHost()
+	}
 }
 
 // Version is what this runner advertises.
-const Version = "0.1.0-p0a"
+const Version = "0.2.0-p0b"
 
 // Capabilities are the flags we advertise at registration. Advertising
 // "cancelling" is a promise: we will notice a stop request, wind down, and say
@@ -56,22 +71,46 @@ type Runner struct {
 	cl   *Client
 	opts Options
 	log  *slog.Logger
+	exec *actExecutor
 }
 
 // New builds a runner.
 func New(cl *Client, opts Options, log *slog.Logger) *Runner {
 	opts.withDefaults()
-	return &Runner{cl: cl, opts: opts, log: log}
+	// act's container client reads DOCKER_HOST from the process environment,
+	// not from its Config — the Config's socket path is for mounting the
+	// daemon *into* a container, which is a different question. So the only
+	// way to point act at a VM-backed daemon is to export it here, once.
+	if os.Getenv("DOCKER_HOST") == "" && opts.DockerHost != "" {
+		_ = os.Setenv("DOCKER_HOST", opts.DockerHost)
+	}
+	return &Runner{
+		cl:   cl,
+		opts: opts,
+		log:  log,
+		exec: &actExecutor{
+			labels:     opts.Labels,
+			actionsURL: opts.ActionsURL,
+			offline:    opts.ActionsOffline,
+			cacheDir:   defaultCacheDir(opts.WorkDir),
+			dockerHost: opts.DockerHost,
+
+			mountDaemonSocket: opts.MountDockerSocket,
+		},
+	}
 }
 
 // Run loops until ctx is cancelled.
 func (r *Runner) Run(ctx context.Context) error {
+	names := r.opts.Labels.Names()
 	if _, err := r.cl.Declare(ctx, &protocol.DeclareRequest{
-		Version: Version, Labels: r.opts.Labels, Capabilities: Capabilities,
+		Version: Version, Labels: names, Capabilities: Capabilities,
 	}); err != nil {
 		return fmt.Errorf("declare: %w", err)
 	}
-	r.log.Info("runner ready", "name", r.opts.Name, "labels", r.opts.Labels, "capabilities", Capabilities)
+	r.log.Info("runner ready", "name", r.opts.Name, "labels", names,
+		"capabilities", Capabilities, "actions_url", r.opts.ActionsURL,
+		"docker_host", r.opts.DockerHost)
 
 	var version int64
 	for {
@@ -106,40 +145,30 @@ func (r *Runner) Run(ctx context.Context) error {
 
 // execute runs one task to completion, streaming logs and heartbeating.
 func (r *Runner) execute(ctx context.Context, task *protocol.Task) error {
-	jobKey, job, err := workflow.JobFromPayload(task.WorkflowPayload)
-	if err != nil {
-		r.finish(ctx, task.ID, protocol.ResultFailure, nil, nil)
-		return err
-	}
-	r.log.Info("task started", "task", task.ID, "job", jobKey, "steps", len(job.Steps))
+	r.log.Info("task started", "task", task.ID, "timeout_min", task.TimeoutMinutes)
 
-	dir := filepath.Join(r.opts.WorkDir, fmt.Sprintf("task-%d", task.ID))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		r.finish(ctx, task.ID, protocol.ResultFailure, nil, nil)
-		return err
-	}
-	defer os.RemoveAll(dir)
+	workdir := filepath.Join(r.opts.WorkDir, fmt.Sprintf("task-%d", task.ID))
+	defer os.RemoveAll(workdir)
 
 	logs := newLogShipper(r.cl, task.ID, r.opts.LogFlushInterval, r.log)
-	defer logs.close(ctx)
 
-	// stopCtx is what the steps run under. The heartbeat cancels it when the
-	// server says stop; cleanup below deliberately does NOT run under it, so a
-	// stop cannot interrupt the winding-down it just asked for.
-	stopCtx, cancelSteps := context.WithCancel(ctx)
-	defer cancelSteps()
+	// stopCtx is what the job runs under. The heartbeat cancels it when the
+	// server says stop; the cleanup below deliberately does NOT run under it,
+	// so a stop cannot interrupt the winding-down it just asked for.
+	stopCtx, cancelJob := context.WithCancel(ctx)
+	defer cancelJob()
 
 	timeout := time.Duration(task.TimeoutMinutes) * time.Minute
 	if timeout <= 0 {
-		timeout = time.Duration(workflow.DefaultTimeoutMinutes) * time.Minute
+		timeout = time.Hour
 	}
 	stopCtx, cancelTimeout := context.WithTimeout(stopCtx, timeout)
 	defer cancelTimeout()
 
 	var (
 		mu      sync.Mutex
-		steps   []protocol.StepState
 		stopped bool
+		stopAt  time.Time
 	)
 	hbCtx, stopHeartbeat := context.WithCancel(ctx)
 	defer stopHeartbeat()
@@ -152,162 +181,105 @@ func (r *Runner) execute(ctx context.Context, task *protocol.Task) error {
 				return
 			case <-t.C:
 			}
-			mu.Lock()
-			snapshot := append([]protocol.StepState(nil), steps...)
-			mu.Unlock()
 			res, err := r.cl.UpdateTask(ctx, &protocol.UpdateTaskRequest{
-				State: &protocol.TaskState{ID: task.ID, Steps: snapshot},
+				State: &protocol.TaskState{ID: task.ID},
 			})
-			if err != nil {
+			if err != nil || !res.StopRequested {
 				continue
 			}
-			if res.StopRequested {
-				mu.Lock()
-				already := stopped
-				stopped = true
-				mu.Unlock()
-				if !already {
-					r.log.Info("stop requested by server, winding down", "task", task.ID)
-					logs.write("::orrery:: stop requested — winding down")
-					cancelSteps()
-				}
+			mu.Lock()
+			already := stopped
+			stopped = true
+			if !already {
+				stopAt = time.Now().UTC()
+			}
+			mu.Unlock()
+			if !already {
+				r.log.Info("stop requested by server, winding down", "task", task.ID)
+				logs.write("::orrery:: stop requested — winding down")
+				cancelJob()
 			}
 		}
 	}()
 
-	result := protocol.ResultSuccess
-	env := os.Environ()
-	for k, v := range job.Env {
-		env = append(env, k+"="+v)
-	}
-
-	for i, step := range job.Steps {
-		started := time.Now().UTC()
-		logIndex := logs.nextIndex()
-		state := protocol.StepState{ID: int64(i), StartedAt: &started, LogIndex: logIndex}
-
-		logs.write(fmt.Sprintf("::group::%s", step.Label(i)))
-		runErr := r.runStep(stopCtx, dir, env, step, logs)
-		logs.write("::endgroup::")
-
-		stoppedAt := time.Now().UTC()
-		state.StoppedAt = &stoppedAt
-		state.LogLength = logs.nextIndex() - logIndex
-
-		switch {
-		case runErr == nil:
-			state.Result = protocol.ResultSuccess
-		case stopCtx.Err() != nil:
-			state.Result = protocol.ResultCancelled
-		case step.ContinueOnError:
-			state.Result = protocol.ResultFailure
-			logs.write(fmt.Sprintf("::warning::step failed but continue-on-error is set: %v", runErr))
-		default:
-			state.Result = protocol.ResultFailure
-		}
-
-		mu.Lock()
-		steps = append(steps, state)
-		mu.Unlock()
-
-		if state.Result == protocol.ResultCancelled {
-			result = protocol.ResultCancelled
-			break
-		}
-		if state.Result == protocol.ResultFailure && !step.ContinueOnError {
-			result = protocol.ResultFailure
-			logs.write(fmt.Sprintf("::error::%s failed: %v", step.Label(i), runErr))
-			break
-		}
-	}
-
+	result, execErr := r.exec.run(stopCtx, task, workdir, logs)
 	stopHeartbeat()
 
 	mu.Lock()
-	wasStopped := stopped
-	final := append([]protocol.StepState(nil), steps...)
+	wasStopped, stoppedAt := stopped, stopAt
 	mu.Unlock()
 
 	// Cleanup runs under the parent context, never under stopCtx: the whole
 	// point of asking a runner to stop is that it gets to finish tidying up.
-	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancelCleanup()
-	logs.flush(cleanupCtx)
+
+	final := protocol.ResultFailure
+	var steps []protocol.StepState
+	var outputs map[string]string
+	if result != nil {
+		final, steps, outputs = result.Result, result.Steps, result.Outputs
+	}
+	// Always surface the execution error. Reporting only the hook's verdict
+	// leaves a failed job with an empty log and no reason, which is the exact
+	// "log visibility" complaint we set out not to reproduce.
+	//
+	// A stop is the exception: "context canceled" is then the thing we were
+	// asked to do, and calling it an error teaches readers to ignore ::error::.
+	if execErr != nil {
+		switch {
+		case wasStopped && errors.Is(execErr, context.Canceled):
+			logs.write("::orrery:: execution ended on the stop request")
+		default:
+			logs.write(fmt.Sprintf("::error::%v", execErr))
+			r.log.Error("job execution returned an error", "task", task.ID, "err", execErr)
+		}
+	}
+	if wasStopped {
+		final = protocol.ResultCancelled
+		steps = markCancelled(steps, stoppedAt)
+	}
 
 	var ackedAt *time.Time
 	if wasStopped {
-		result = protocol.ResultCancelled
+		logs.write("::orrery:: cleanup complete, acknowledging stop")
 		now := time.Now().UTC()
 		ackedAt = &now
-		logs.write("::orrery:: cleanup complete, acknowledging stop")
-		logs.flush(cleanupCtx)
 	}
+	logs.close(cleanupCtx)
 
-	r.log.Info("task complete", "task", task.ID, "result", result, "stopped", wasStopped)
-	r.finish(cleanupCtx, task.ID, result, final, ackedAt)
-	return nil
+	r.log.Info("task complete", "task", task.ID, "result", final, "stopped", wasStopped, "steps", len(steps))
+	r.finish(cleanupCtx, task.ID, final, steps, outputs, ackedAt)
+	return execErr
 }
 
-func (r *Runner) finish(ctx context.Context, id int64, result protocol.Result, steps []protocol.StepState, acked *time.Time) {
+// markCancelled relabels the steps a stop interrupted. act has no cancelled
+// outcome for a step: a context cancellation surfaces as a plain failure, so a
+// job everyone agreed to stop would otherwise read as a job that broke. Steps
+// that had already settled before the stop keep whatever they settled as — a
+// genuine failure does not become a cancellation because a stop followed it.
+func markCancelled(steps []protocol.StepState, stoppedAt time.Time) []protocol.StepState {
+	for i := range steps {
+		st := &steps[i]
+		switch {
+		case st.Result == protocol.ResultUnspecified && st.StartedAt != nil:
+			st.Result = protocol.ResultCancelled
+		case st.Result == protocol.ResultFailure &&
+			(st.StoppedAt == nil || !st.StoppedAt.Before(stoppedAt)):
+			st.Result = protocol.ResultCancelled
+		}
+	}
+	return steps
+}
+
+func (r *Runner) finish(ctx context.Context, id int64, result protocol.Result, steps []protocol.StepState, outputs map[string]string, acked *time.Time) {
 	now := time.Now().UTC()
 	if _, err := r.cl.UpdateTask(ctx, &protocol.UpdateTaskRequest{
 		State: &protocol.TaskState{
 			ID: id, Result: result, StoppedAt: &now, StopAckedAt: acked, Steps: steps,
 		},
+		Outputs: outputs,
 	}); err != nil {
 		r.log.Error("final update failed", "task", id, "err", err)
 	}
-}
-
-// runStep executes a single `run:` step, streaming stdout and stderr into the
-// log shipper as they arrive.
-func (r *Runner) runStep(ctx context.Context, dir string, env []string, step workflow.Step, logs *logShipper) error {
-	if step.Uses != "" {
-		return fmt.Errorf("`uses:` is not executable in this build (%s)", step.Uses)
-	}
-	if step.Run == "" {
-		return nil
-	}
-	shell := step.Shell
-	if shell == "" {
-		shell = "bash"
-	}
-	var cmd *exec.Cmd
-	switch shell {
-	case "bash", "sh":
-		cmd = exec.CommandContext(ctx, shell, "-eo", "pipefail", "-c", step.Run)
-	default:
-		cmd = exec.CommandContext(ctx, shell, "-c", step.Run)
-	}
-	cmd.Dir = dir
-	if step.WorkingDirectory != "" {
-		cmd.Dir = filepath.Join(dir, step.WorkingDirectory)
-		if err := os.MkdirAll(cmd.Dir, 0o755); err != nil {
-			return err
-		}
-	}
-	cmd.Env = append(append([]string(nil), env...), flatten(step.Env)...)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		logs.write(scanner.Text())
-	}
-	return cmd.Wait()
-}
-
-func flatten(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k, v := range m {
-		out = append(out, k+"="+v)
-	}
-	return out
 }

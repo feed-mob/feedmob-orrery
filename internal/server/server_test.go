@@ -115,7 +115,7 @@ func TestUnknownRunnerTokenGets401(t *testing.T) {
 	}
 }
 
-func TestSubmitRejectsUnsupportedStepsUpFront(t *testing.T) {
+func TestSubmitAcceptsActionsNowThatActRunsThem(t *testing.T) {
 	hs, _ := testServer(t)
 	body, _ := json.Marshal(SubmitRequest{Repo: "r", Workflow: `
 name: t
@@ -123,21 +123,82 @@ jobs:
   a:
     steps:
       - uses: actions/checkout@v4
+      - run: echo hi
 `})
 	res, err := http.Post(hs.URL+"/api/runs", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 at submit time rather than a runner failing midway", res.StatusCode)
+	if res.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(res.Body)
+		t.Fatalf("status = %d: %s", res.StatusCode, data)
 	}
-	var out struct {
-		Unsupported []string `json:"unsupported"`
+}
+
+// The github context is what actions/checkout reads; a task carrying only YAML
+// cannot run a real workflow.
+func TestDispatchedTaskCarriesTheGithubContextAndSecrets(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "ctx.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
 	}
-	_ = json.NewDecoder(res.Body).Decode(&out)
-	if len(out.Unsupported) == 0 {
-		t.Error("response did not name which steps are unsupported")
+	t.Cleanup(func() { st.Close() })
+	srv := New(st, Config{
+		RegistrationToken: regToken,
+		FetchHold:         50 * time.Millisecond,
+		Secrets:           map[string]string{"GITHUB_TOKEN": "tok", "DEPLOY_KEY": "k"},
+		Vars:              map[string]string{"REGION": "us-east-1"},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	hs := httptest.NewServer(srv)
+	t.Cleanup(hs.Close)
+
+	token := register(t, hs.URL)
+	body, _ := json.Marshal(SubmitRequest{
+		Repo: "feed-mob/demo", WorkflowFile: "ci.yml", Event: "push",
+		Ref: "refs/heads/main", SHA: "deadbeef", Actor: "someone",
+		Workflow: "name: t\njobs:\n  a:\n    steps:\n      - run: echo hi\n",
+	})
+	res, err := http.Post(hs.URL+"/api/runs", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	res.Body.Close()
+
+	fetched, _ := rpc[protocol.FetchTaskRequest, protocol.FetchTaskResponse](t, hs.URL, token, "FetchTask",
+		&protocol.FetchTaskRequest{})
+	if fetched.Task == nil {
+		t.Fatal("no task dispatched")
+	}
+	ctxWant := map[string]string{
+		"repository": "feed-mob/demo",
+		"ref":        "refs/heads/main",
+		"sha":        "deadbeef",
+		"actor":      "someone",
+		"event_name": "push",
+		"token":      "tok",
+	}
+	for k, want := range ctxWant {
+		if got, _ := fetched.Task.Context[k].(string); got != want {
+			t.Errorf("context[%q] = %q, want %q", k, got, want)
+		}
+	}
+	if fetched.Task.Secrets["DEPLOY_KEY"] != "k" {
+		t.Error("secrets did not reach the task")
+	}
+	if fetched.Task.Vars["REGION"] != "us-east-1" {
+		t.Error("vars did not reach the task")
+	}
+
+	// Secrets are injected, never persisted: the database holds what ran, not
+	// what it ran with.
+	var hits int
+	if err := st.DB().QueryRow(
+		`SELECT COUNT(*) FROM jobs WHERE payload LIKE '%DEPLOY_KEY%' OR payload LIKE '%tok%'`).Scan(&hits); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if hits != 0 {
+		t.Error("a secret value reached the database")
 	}
 }
 

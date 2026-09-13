@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -94,13 +96,18 @@ func submit(base string, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Default repo/ref/sha to the checkout we are submitting from. These become
+	// the `github` context, and actions read it literally: actions/checkout
+	// rejects anything that is not owner/repo, so a placeholder like "local"
+	// breaks the very first step of a realistic workflow.
+	repo, ref, sha := gitIdentity(filepath.Dir(path))
 	body := map[string]string{
-		"repo":          flagValue(args, "repo", "local"),
+		"repo":          flagValue(args, "repo", repo),
 		"workflow_file": path,
 		"workflow":      string(data),
 		"event":         flagValue(args, "event", "manual"),
-		"ref":           flagValue(args, "ref", ""),
-		"sha":           flagValue(args, "sha", ""),
+		"ref":           flagValue(args, "ref", ref),
+		"sha":           flagValue(args, "sha", sha),
 		"actor":         env("USER", "cli"),
 	}
 	var out struct {
@@ -115,6 +122,68 @@ func submit(base string, args []string) error {
 		return nil
 	}
 	return waitForRun(base, out.RunID)
+}
+
+// gitIdentity reads owner/repo, ref and sha out of the git checkout at dir,
+// falling back to the working directory when the workflow file sits outside a
+// repository — a scratch workflow run against the repo you are standing in is
+// a normal thing to want, and it beats submitting a placeholder repository that
+// actions/checkout will fail on.
+//
+// Anything it still cannot determine falls back to a value that is at least the
+// right shape, so a workflow submitted from nowhere in particular still runs.
+func gitIdentity(dir string) (repo, ref, sha string) {
+	if !isGitRepo(dir) {
+		dir = "."
+	}
+	repo, ref, sha = "orrery/local", "refs/heads/main", ""
+	git := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		out, err := cmd.Output()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if url := git("remote", "get-url", "origin"); url != "" {
+		if name := repoFromRemote(url); name != "" {
+			repo = name
+		}
+	}
+	if branch := git("rev-parse", "--abbrev-ref", "HEAD"); branch != "" && branch != "HEAD" {
+		ref = "refs/heads/" + branch
+	}
+	if head := git("rev-parse", "HEAD"); head != "" {
+		sha = head
+	}
+	return repo, ref, sha
+}
+
+func isGitRepo(dir string) bool {
+	return exec.Command("git", "-C", dir, "rev-parse", "--git-dir").Run() == nil
+}
+
+// repoFromRemote turns any of git@host:owner/repo.git, https://host/owner/repo
+// or ssh://host/owner/repo.git into owner/repo.
+func repoFromRemote(url string) string {
+	url = strings.TrimSuffix(strings.TrimSpace(url), ".git")
+	if i := strings.LastIndex(url, ":"); i >= 0 && !strings.Contains(url[i+1:], "/") {
+		// scp-style git@host:owner/repo has no slash after the colon only when
+		// the path itself is bare; otherwise fall through to the slash split.
+		url = url[i+1:]
+	}
+	parts := strings.Split(url, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	owner, name := parts[len(parts)-2], parts[len(parts)-1]
+	if i := strings.LastIndexAny(owner, ":"); i >= 0 {
+		owner = owner[i+1:]
+	}
+	if owner == "" || name == "" {
+		return ""
+	}
+	return owner + "/" + name
 }
 
 func waitForRun(base string, id int64) error {
@@ -154,6 +223,15 @@ type runSummary struct {
 		StopReason      string `json:"StopReason"`
 		ForceTerminated bool   `json:"ForceTerminated"`
 		CleanupRan      bool   `json:"CleanupRan"`
+		Steps           []struct {
+			Index     int        `json:"Index"`
+			Name      string     `json:"Name"`
+			Result    string     `json:"Result"`
+			StartedAt *time.Time `json:"StartedAt"`
+			StoppedAt *time.Time `json:"StoppedAt"`
+			LogIndex  int64      `json:"LogIndex"`
+			LogLength int64      `json:"LogLength"`
+		} `json:"Steps"`
 	} `json:"Jobs"`
 }
 
@@ -204,7 +282,32 @@ func printRun(sum *runSummary) {
 		}
 		fmt.Printf("%-8d %-18s %-10s %-10s %-8s %s\n",
 			j.ID, truncate(j.Key, 18), j.Status, j.Result, fmt.Sprintf("%dm", j.TimeoutMinutes), note)
+		for _, st := range j.Steps {
+			// The log range is the point of printing this: it turns "which
+			// step failed" into "which lines to read".
+			lines := "-"
+			if st.LogLength > 0 {
+				lines = fmt.Sprintf("%d-%d", st.LogIndex, st.LogIndex+st.LogLength-1)
+			}
+			fmt.Printf("  %-2d %-38s %-10s %-9s log %s\n",
+				st.Index, truncate(stepName(st.Name, st.Index), 38), st.Result,
+				stepDuration(st.StartedAt, st.StoppedAt), lines)
+		}
 	}
+}
+
+func stepName(name string, index int) string {
+	if name != "" {
+		return name
+	}
+	return fmt.Sprintf("step %d", index)
+}
+
+func stepDuration(started, stopped *time.Time) string {
+	if started == nil || stopped == nil {
+		return ""
+	}
+	return stopped.Sub(*started).Round(time.Millisecond).String()
 }
 
 func showLogs(base string, args []string) error {

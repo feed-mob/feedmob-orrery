@@ -30,11 +30,16 @@ func main() {
 	var (
 		serverURL = flag.String("server", "http://127.0.0.1:8080", "orrery server URL")
 		name      = flag.String("name", host, "runner name")
-		labelsRaw = flag.String("labels", "self-hosted,host", "comma-separated labels this runner advertises")
-		regToken  = flag.String("registration-token", os.Getenv("ORRERY_REGISTRATION_TOKEN"), "registration secret, used once")
-		credPath  = flag.String("credentials", "orrery-runner.json", "where to persist the runner token")
-		workDir   = flag.String("work-dir", "", "directory for job workspaces")
-		verbose   = flag.Bool("v", false, "debug logging")
+		labelsRaw = flag.String("labels", "self-hosted:host,ubuntu-latest:docker://catthehacker/ubuntu:act-22.04",
+			"comma-separated `name[:schema[:arg]]` labels, e.g. self-hosted:host or ubuntu-latest:docker://image")
+		regToken       = flag.String("registration-token", os.Getenv("ORRERY_REGISTRATION_TOKEN"), "registration secret, used once")
+		credPath       = flag.String("credentials", "orrery-runner.json", "where to persist the runner token")
+		workDir        = flag.String("work-dir", "", "directory for job workspaces and the action cache")
+		actionsURL     = flag.String("actions-url", "https://github.com", "where `uses: owner/repo@ref` resolves from; point at a mirror to stop depending on github.com at runtime")
+		actionsOffline = flag.Bool("actions-offline", false, "serve only already-cached actions and refuse network fetches")
+		dockerHost     = flag.String("docker-host", os.Getenv("DOCKER_HOST"), "docker daemon for container jobs; empty probes the conventional socket paths")
+		mountSock      = flag.Bool("mount-docker-socket", false, "bind the docker daemon into every job container so steps can run `docker`; this lets a step escape its own sandbox, so leave it off unless the jobs are trusted")
+		verbose        = flag.Bool("v", false, "debug logging")
 	)
 	flag.Parse()
 
@@ -44,7 +49,14 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	labels := splitLabels(*labelsRaw)
+	labels, err := runner.ParseLabels(splitLabels(*labelsRaw))
+	if err != nil {
+		// A misconfigured label set is rejected at startup, not at dispatch:
+		// a runner that registers and then cannot run anything is worse than
+		// one that refuses to start.
+		slog.New(slog.NewTextHandler(os.Stderr, nil)).Error("bad -labels", "err", err)
+		os.Exit(2)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -64,7 +76,7 @@ func main() {
 			Name:         *name,
 			Token:        *regToken,
 			Version:      runner.Version,
-			Labels:       labels,
+			Labels:       labels.Names(),
 			Capabilities: runner.Capabilities,
 		})
 		if err != nil {
@@ -81,9 +93,13 @@ func main() {
 	cl.SetToken(creds.Token)
 
 	r := runner.New(cl, runner.Options{
-		Name:    creds.Name,
-		Labels:  labels,
-		WorkDir: *workDir,
+		Name:              creds.Name,
+		Labels:            labels,
+		WorkDir:           *workDir,
+		ActionsURL:        *actionsURL,
+		ActionsOffline:    *actionsOffline,
+		DockerHost:        *dockerHost,
+		MountDockerSocket: *mountSock,
 	}, log)
 
 	if err := r.Run(ctx); err != nil {

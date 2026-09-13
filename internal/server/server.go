@@ -32,6 +32,51 @@ type Config struct {
 	StopGrace time.Duration
 	// ReaperInterval is how often timeouts and unacked stops are swept.
 	ReaperInterval time.Duration
+	// Secrets are injected into a task at dispatch time. They are deliberately
+	// not persisted: the database holds what ran, never what it ran with, so a
+	// leaked database file is not a leaked credential set.
+	Secrets map[string]string
+	// Vars are non-secret configuration, same injection path.
+	Vars map[string]string
+	// Forge is where the code being built lives. It becomes github.server_url /
+	// api_url / graphql_url, which actions read literally — actions/checkout
+	// builds its clone URL from it. This is a different question from where
+	// `uses:` resolves from (the runner's -actions-url), because a repository
+	// and the action registry need not be the same host.
+	Forge Forge
+}
+
+// Forge is the code host a run belongs to.
+type Forge struct {
+	URL        string
+	APIURL     string
+	GraphQLURL string
+}
+
+// withDefaults fills in the URLs a forge did not state. github.com's API lives
+// on a separate host; every other forge is assumed to follow the GitHub
+// Enterprise convention of /api/v3, which is right for GHES and wrong for Gitea
+// (/api/v1) — so a Gitea deployment must set APIURL explicitly rather than
+// inherit a guess.
+func (f *Forge) withDefaults() {
+	if f.URL == "" {
+		f.URL = "https://github.com"
+	}
+	f.URL = strings.TrimSuffix(f.URL, "/")
+	if f.APIURL == "" {
+		if f.URL == "https://github.com" {
+			f.APIURL = "https://api.github.com"
+		} else {
+			f.APIURL = f.URL + "/api/v3"
+		}
+	}
+	if f.GraphQLURL == "" {
+		if f.URL == "https://github.com" {
+			f.GraphQLURL = "https://api.github.com/graphql"
+		} else {
+			f.GraphQLURL = f.URL + "/api/graphql"
+		}
+	}
 }
 
 func (c *Config) withDefaults() {
@@ -44,6 +89,7 @@ func (c *Config) withDefaults() {
 	if c.ReaperInterval <= 0 {
 		c.ReaperInterval = 5 * time.Second
 	}
+	c.Forge.withDefaults()
 }
 
 // Server wires the store to HTTP.
@@ -266,12 +312,35 @@ func (s *Server) tryClaim(ctx context.Context, runner *store.Runner) (*protocol.
 	for k, v := range outputs {
 		needs[k] = protocol.TaskNeed{Outputs: v, Result: protocol.Result(results[k])}
 	}
-	s.log.Info("task dispatched", "job", job.ID, "key", job.Key, "runner", runner.Name, "timeout_min", job.TimeoutMinutes)
+	run, err := s.st.RunMeta(ctx, job.RunID)
+	if err != nil {
+		return nil, version, err
+	}
+
+	s.log.Info("task dispatched", "job", job.ID, "key", job.Key, "runner", runner.Name,
+		"repo", run.Repo, "timeout_min", job.TimeoutMinutes)
 	return &protocol.Task{
 		ID:              job.ID,
 		WorkflowPayload: []byte(job.Payload),
 		Needs:           needs,
 		TimeoutMinutes:  job.TimeoutMinutes,
+		// The github context is what actions/checkout reads. A task carrying
+		// only YAML cannot run a real workflow.
+		Context: map[string]any{
+			"repository": run.Repo,
+			"ref":        run.Ref,
+			"sha":        run.SHA,
+			"actor":      run.Actor,
+			"event_name": run.Event,
+			"workflow":   run.WorkflowName,
+			"token":      s.cfg.Secrets["GITHUB_TOKEN"],
+
+			"server_url":  s.cfg.Forge.URL,
+			"api_url":     s.cfg.Forge.APIURL,
+			"graphql_url": s.cfg.Forge.GraphQLURL,
+		},
+		Secrets: s.cfg.Secrets,
+		Vars:    s.cfg.Vars,
 	}, version, nil
 }
 
@@ -301,7 +370,7 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 		steps := make([]store.StepReport, 0, len(req.State.Steps))
 		for i, st := range req.State.Steps {
 			steps = append(steps, store.StepReport{
-				Index: i, Result: string(st.Result),
+				Index: i, Name: st.Name, Result: string(st.Result),
 				StartedAt: st.StartedAt, StoppedAt: st.StoppedAt,
 				LogIndex: st.LogIndex, LogLength: st.LogLength,
 			})
@@ -398,20 +467,10 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Reject what we cannot execute at submit time rather than letting a runner
-	// discover it halfway through a job.
-	if bad := wf.UnsupportedSteps(); len(bad) > 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error":       "workflow uses features this build cannot execute",
-			"unsupported": bad,
-		})
-		return
-	}
-
 	jobs := make([]store.NewJob, 0, len(wf.JobOrder))
 	for _, key := range wf.JobOrder {
 		j := wf.Jobs[key]
-		payload, err := wf.JobPayload(key)
+		payload, err := wf.JobPayload([]byte(req.Workflow), key)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -431,7 +490,10 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.wake.broadcast()
-	s.log.Info("run created", "run", runID, "workflow", wf.Name, "jobs", len(jobs))
+	// Recording which third-party actions a run pulls in is the input to
+	// pinning them by SHA behind a mirror later; it costs nothing now.
+	s.log.Info("run created", "run", runID, "workflow", wf.Name,
+		"jobs", len(jobs), "actions", wf.UsedActions())
 	writeJSON(w, http.StatusOK, SubmitResponse{RunID: runID, Jobs: wf.JobOrder})
 }
 

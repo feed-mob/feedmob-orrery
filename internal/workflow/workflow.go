@@ -1,9 +1,9 @@
 // Package workflow parses the GitHub Actions workflow syntax.
 //
-// P0 covers the subset the spine needs: jobs, needs, runs-on, timeout-minutes,
-// env, and `run` steps. `uses:` steps parse but do not execute yet — that
-// arrives with the act executor in P0b, and until then a job containing one is
-// rejected at submit time rather than failing halfway through on a runner.
+// Parsing here is deliberately shallow: it covers what the scheduler needs to
+// build the job graph — jobs, needs, runs-on, timeout-minutes, env — and hands
+// the rest to act, which owns expression evaluation and step execution. Two
+// parsers disagreeing about the same file is worse than one doing less.
 package workflow
 
 import (
@@ -214,58 +214,83 @@ func (wf *Workflow) validate() error {
 	return nil
 }
 
-// UnsupportedSteps lists steps this build cannot execute yet, so submission can
-// fail loudly instead of a runner failing halfway through.
-func (wf *Workflow) UnsupportedSteps() []string {
+// UsedActions lists every `uses:` reference in the workflow.
+//
+// Nothing rejects these any more — act resolves and runs them — but the server
+// records them so an operator can see at a glance which third-party code a run
+// pulled in, which is the input to pinning them by SHA behind a mirror.
+func (wf *Workflow) UsedActions() []string {
+	seen := map[string]bool{}
 	var out []string
 	for _, key := range wf.JobOrder {
-		job := wf.Jobs[key]
-		for i, st := range job.Steps {
-			if st.Uses != "" {
-				out = append(out, fmt.Sprintf("%s.steps[%d]: `uses: %s` (actions arrive with the act executor)", key, i, st.Uses))
+		for _, st := range wf.Jobs[key].Steps {
+			if st.Uses == "" || seen[st.Uses] {
+				continue
 			}
+			seen[st.Uses] = true
+			out = append(out, st.Uses)
 		}
 	}
 	return out
 }
 
-// JobPayload renders a single job back to YAML, carrying the workflow-level env
-// down into it. This is what travels to the runner: the job it must run and
-// nothing else.
-func (wf *Workflow) JobPayload(key string) ([]byte, error) {
-	job, ok := wf.Jobs[key]
-	if !ok {
+// JobPayload renders the workflow down to a single job, as a workflow file act
+// can read directly.
+//
+// The trimming happens on the YAML node tree rather than by re-serialising our
+// parsed structs: this parser models only what the scheduler needs, so
+// round-tripping through it would silently drop `strategy`, `container`,
+// `services`, `defaults` and anything else act understands but we do not. The
+// runner must receive the author's YAML, not our summary of it.
+func (wf *Workflow) JobPayload(source []byte, key string) ([]byte, error) {
+	if _, ok := wf.Jobs[key]; !ok {
 		return nil, fmt.Errorf("no such job %q", key)
 	}
-	merged := map[string]string{}
-	for k, v := range wf.Env {
-		merged[k] = v
+	var doc yaml.Node
+	if err := yaml.Unmarshal(source, &doc); err != nil {
+		return nil, fmt.Errorf("reparse workflow: %w", err)
 	}
-	for k, v := range job.Env {
-		merged[k] = v
+	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("workflow is not a mapping")
 	}
-	clone := *job
-	clone.Env = merged
-	payload := map[string]any{
-		"name":            wf.Name,
-		"job_key":         key,
-		"job":             clone,
-		"timeout-minutes": job.TimeoutMinutes,
+	root := doc.Content[0]
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "jobs" {
+			continue
+		}
+		jobs := root.Content[i+1]
+		trimmed := &yaml.Node{Kind: yaml.MappingNode, Tag: jobs.Tag}
+		for j := 0; j+1 < len(jobs.Content); j += 2 {
+			if jobs.Content[j].Value != key {
+				continue
+			}
+			trimmed.Content = append(trimmed.Content, jobs.Content[j], stripNeeds(jobs.Content[j+1]))
+		}
+		if len(trimmed.Content) == 0 {
+			return nil, fmt.Errorf("job %q vanished while trimming", key)
+		}
+		root.Content[i+1] = trimmed
+		return yaml.Marshal(&doc)
 	}
-	return yaml.Marshal(payload)
+	return nil, fmt.Errorf("workflow has no jobs mapping")
 }
 
-// JobFromPayload parses what JobPayload produced.
-func JobFromPayload(data []byte) (string, *Job, error) {
-	var p struct {
-		JobKey string `yaml:"job_key"`
-		Job    *Job   `yaml:"job"`
+// stripNeeds removes `needs:` from the job we send.
+//
+// The dependency graph is the server's business: it has already held this job
+// until its upstreams settled, and it passes their outputs down in the needs
+// context. Leaving `needs:` in the payload would make act look for sibling jobs
+// that are not in the file and refuse to plan.
+func stripNeeds(job *yaml.Node) *yaml.Node {
+	if job.Kind != yaml.MappingNode {
+		return job
 	}
-	if err := yaml.Unmarshal(data, &p); err != nil {
-		return "", nil, fmt.Errorf("parse job payload: %w", err)
+	out := &yaml.Node{Kind: yaml.MappingNode, Tag: job.Tag, Style: job.Style}
+	for i := 0; i+1 < len(job.Content); i += 2 {
+		if job.Content[i].Value == "needs" {
+			continue
+		}
+		out.Content = append(out.Content, job.Content[i], job.Content[i+1])
 	}
-	if p.Job == nil {
-		return "", nil, fmt.Errorf("job payload has no job")
-	}
-	return p.JobKey, p.Job, nil
+	return out
 }

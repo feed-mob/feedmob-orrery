@@ -5,10 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -234,6 +234,9 @@ type Job struct {
 	StopAckedAt     *time.Time
 	ForceTerminated bool
 	CleanupRan      bool
+	// Steps is filled by the readers that return a whole run; the dispatch path
+	// leaves it nil, because a runner claiming work has no use for it.
+	Steps []StepReport
 }
 
 // CreateRun stores a run and its jobs in one transaction, then bumps the tasks

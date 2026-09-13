@@ -422,6 +422,25 @@ type RunSummary struct {
 	Jobs []Job
 }
 
+// RunMeta returns just the run's identity fields, for building the github
+// context a task needs.
+func (s *Store) RunMeta(ctx context.Context, runID int64) (*Run, error) {
+	var r Run
+	var created string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, repo, workflow_name, workflow_file, event, ref, sha, actor, status, result, created_at
+		FROM runs WHERE id = ?`, runID).Scan(&r.ID, &r.Repo, &r.WorkflowName, &r.WorkflowFile, &r.Event,
+		&r.Ref, &r.SHA, &r.Actor, &r.Status, &r.Result, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	return &r, nil
+}
+
 // ListRuns returns the most recent runs.
 func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
 	if limit <= 0 {
@@ -481,7 +500,54 @@ func (s *Store) RunByID(ctx context.Context, id int64) (*RunSummary, error) {
 		}
 		jobs = append(jobs, *j)
 	}
-	return &RunSummary{Run: r, Jobs: jobs}, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range jobs {
+		steps, err := s.StepsOf(ctx, jobs[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		jobs[i].Steps = steps
+	}
+	return &RunSummary{Run: r, Jobs: jobs}, nil
+}
+
+// StepsOf returns a job's step timeline in declaration order. The log_index and
+// log_length columns are what let a reader jump straight to the slice of the
+// stream a step produced, instead of scrolling a job-length log to find it.
+func (s *Store) StepsOf(ctx context.Context, jobID int64) ([]StepReport, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT step_index, name, result, started_at, stopped_at, log_index, log_length
+		FROM job_steps WHERE job_id = ? ORDER BY step_index ASC`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StepReport
+	for rows.Next() {
+		var st StepReport
+		var started, stopped sql.NullString
+		if err := rows.Scan(&st.Index, &st.Name, &st.Result, &started, &stopped,
+			&st.LogIndex, &st.LogLength); err != nil {
+			return nil, err
+		}
+		st.StartedAt = parseNullTime(started)
+		st.StoppedAt = parseNullTime(stopped)
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+func parseNullTime(v sql.NullString) *time.Time {
+	if !v.Valid || v.String == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, v.String)
+	if err != nil {
+		return nil
+	}
+	return &t
 }
 
 // MarshalNeeds is a helper for building the needs context payload.

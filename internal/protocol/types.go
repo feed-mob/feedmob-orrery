@@ -131,7 +131,11 @@ type Task struct {
 // ---- UpdateTask ----
 
 type StepState struct {
-	ID        int64      `json:"id"`
+	ID int64 `json:"id"`
+	// Name is Orrery's addition to the contract. The upstream proto identifies
+	// a step only by index, which is enough to colour a progress bar and not
+	// enough to tell someone which step failed without re-reading the workflow.
+	Name      string     `json:"name,omitempty"`
 	Result    Result     `json:"result,omitempty"`
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	StoppedAt *time.Time `json:"stopped_at,omitempty"`

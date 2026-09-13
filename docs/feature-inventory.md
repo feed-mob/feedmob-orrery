@@ -8,6 +8,31 @@
 
 ---
 
+## 实现状态（2026-09-13）
+
+P0 的骨架与执行器都已跑通，以下条目**已验证可用**，不再是计划：
+
+| # | 条目 | 验证方式 |
+|---|---|---|
+| 8 | GitHub Actions 兼容 YAML | `examples/*.yml` 原样提交即跑 |
+| 10 | 依赖 DAG（`needs:`） | `examples/hello.yml` 四 job：build →（test, lint）→ report |
+| 11 | 可复用 action（`uses:`） | `examples/with-actions.yml`：`actions/checkout@v4` 真克隆、`actions/setup-node@v4` 装出 node v20 |
+| 13 | 容器里按步骤跑命令 | 同上，`catthehacker/ubuntu:act-22.04` |
+| 17 | 超时 / 取消传播，**默认开启** | `timeout_minutes` NOT NULL DEFAULT 60；回收器到点请求停止 |
+| 20 | **带确认的协作式停止** | `stop_requested_at` → `stop_acked_at`（实测 1.2s），`force_terminated=0`，`cleanup_ran=1` |
+| 25 | 实时日志流 | ack 定义投递；`::group::` 原样保留 |
+| 29 | 密钥：作用域、按步注入 | 派发时注入，不落库；服务端日志只打印密钥名 |
+| 31 | CLI：本地 = 生产同一引擎 | `orrery submit/runs/run/logs/stop` |
+| 43 | runner label 路由 | `label[:schema[:args]]`，一个 runner 同时服务容器与宿主 job |
+| 48 | `vars` 配置变量 | 与密钥同一注入路径，`ORRERY_VAR_*` |
+| 49 | 步骤摘要与注解 | 步骤时间线（名称 / 结果 / 耗时 / 日志区间）落库并在 CLI 展示 |
+
+**下一项是 #47 状态回写**——没有它 Orrery 挂不上现有的 PR 与分支保护流程，这是对标清单里最要紧的缺口。
+
+**已知边界**（见 README）：`GITHUB_API_URL` 对 github.com 是错的（`gitea/runner` v1.0.8 硬编码 Gitea 的 API 形状，无配置开关）；host 模式的 job 继承 runner 进程的环境变量。
+
+---
+
 ### 一、触发 —— 一个任务怎么开始
 
 | # | 功能（能干什么） | 对标 GitHub Actions | 对标其他产品 | 来源·阶段 |

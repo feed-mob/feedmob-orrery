@@ -106,7 +106,7 @@ jobs:
 	}
 }
 
-func TestUnsupportedStepsAreReportedBeforeDispatch(t *testing.T) {
+func TestUsedActionsAreRecordedForLaterPinning(t *testing.T) {
 	wf, err := Parse([]byte(`
 name: t
 jobs:
@@ -118,48 +118,79 @@ jobs:
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	bad := wf.UnsupportedSteps()
-	if len(bad) != 1 || !strings.Contains(bad[0], "actions/checkout@v4") {
-		t.Fatalf("UnsupportedSteps = %v, want the uses step named", bad)
+	used := wf.UsedActions()
+	if len(used) != 1 || used[0] != "actions/checkout@v4" {
+		t.Fatalf("UsedActions = %v, want the one action named", used)
 	}
 }
 
-func TestJobPayloadRoundTripMergesWorkflowEnv(t *testing.T) {
-	wf, err := Parse([]byte(`
+func TestJobPayloadKeepsOneJobAndPreservesUnmodelledFields(t *testing.T) {
+	src := []byte(`
 name: t
 env:
   FROM_WORKFLOW: "1"
-  OVERRIDDEN: workflow
 jobs:
-  a:
-    env:
-      OVERRIDDEN: job
+  build:
+    runs-on: ubuntu-latest
     steps:
-      - name: hi
-        run: echo hi
-`))
+      - run: echo build
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [18, 20]
+    container:
+      image: node:20
+    services:
+      db:
+        image: postgres:16
+    steps:
+      - run: echo test
+`)
+	wf, err := Parse(src)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	payload, err := wf.JobPayload("a")
+	payload, err := wf.JobPayload(src, "test")
 	if err != nil {
 		t.Fatalf("JobPayload: %v", err)
 	}
-	key, job, err := JobFromPayload(payload)
+	out := string(payload)
+
+	// Only the requested job survives.
+	if strings.Contains(out, "echo build") {
+		t.Error("payload still carries the sibling job")
+	}
+	if !strings.Contains(out, "echo test") {
+		t.Error("payload lost the job it was asked for")
+	}
+	// Workflow-level keys stay, so act sees the file the author wrote.
+	if !strings.Contains(out, "FROM_WORKFLOW") {
+		t.Error("workflow-level env was dropped")
+	}
+	// Fields this parser does not model must survive verbatim; re-serialising
+	// our own structs would have silently eaten all three.
+	for _, want := range []string{"strategy", "matrix", "container", "services", "postgres:16"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("payload dropped %q, which this parser does not model", want)
+		}
+	}
+	// needs is the server's business and act would look for a job that is no
+	// longer in the file.
+	if strings.Contains(out, "needs") {
+		t.Error("payload still carries needs:")
+	}
+}
+
+func TestJobPayloadRejectsAnUnknownJob(t *testing.T) {
+	src := []byte("name: t\njobs:\n  a:\n    steps:\n      - run: echo hi\n")
+	wf, err := Parse(src)
 	if err != nil {
-		t.Fatalf("JobFromPayload: %v", err)
+		t.Fatalf("parse: %v", err)
 	}
-	if key != "a" {
-		t.Errorf("job key = %q, want a", key)
-	}
-	if job.Env["FROM_WORKFLOW"] != "1" {
-		t.Error("workflow-level env did not reach the job")
-	}
-	if job.Env["OVERRIDDEN"] != "job" {
-		t.Errorf("OVERRIDDEN = %q, want the job's value to win", job.Env["OVERRIDDEN"])
-	}
-	if len(job.Steps) != 1 || job.Steps[0].Run != "echo hi" {
-		t.Errorf("steps did not survive the round trip: %+v", job.Steps)
+	if _, err := wf.JobPayload(src, "nope"); err == nil {
+		t.Fatal("JobPayload accepted a job that does not exist")
 	}
 }
 

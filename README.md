@@ -105,16 +105,27 @@ Orrery 读得懂现有的 workflow 文件，但底下是我们自己的引擎。
 go build -o bin/ ./cmd/...
 export ORRERY_REGISTRATION_TOKEN=$(openssl rand -hex 16)
 
-./bin/orrery-server -db orrery.db &          # 控制面
-./bin/orrery-runner -labels self-hosted &    # runner，首次用注册令牌换自己的令牌
+# 密钥只在派发时注入进程与容器，从不落库
+printf 'GITHUB_TOKEN=%s\n' "$(gh auth token)" > secrets.env && chmod 600 secrets.env
 
-./bin/orrery submit examples/hello.yml --wait
+./bin/orrery-server -db orrery.db -secrets secrets.env &     # 控制面
+./bin/orrery-runner \
+  -labels 'self-hosted:host,ubuntu-latest:docker://catthehacker/ubuntu:act-22.04' &
+
+./bin/orrery submit examples/with-actions.yml --wait   # checkout + setup-node，跑在容器里
+./bin/orrery submit examples/hello.yml --wait          # 4 个 job 的 DAG，跑在宿主机
 ./bin/orrery runs
+./bin/orrery run <run-id>                     # 含每一步的结果、耗时与日志区间
 ./bin/orrery logs <job-id>
-./bin/orrery stop <job-id>                   # 请求停止；runner 收尾后确认
+./bin/orrery stop <job-id>                    # 请求停止；runner 收尾后确认
 ```
 
-### P0a 已经能做什么
+`submit` 默认从 workflow 所在的 git 检出读取 `repo` / `ref` / `sha`——这三个值直接变成
+`github` 上下文，`actions/checkout` 按字面使用它们。`-forge-url` 指向代码所在的
+forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`uses:` 从哪解析）
+是两个独立问题。
+
+### P0 已经能做什么
 
 | | 状态 |
 |---|---|
@@ -122,11 +133,29 @@ export ORRERY_REGISTRATION_TOKEN=$(openssl rand -hex 16)
 | runner.v1 协议（`Register` / `Declare` / `FetchTask` / `UpdateTask` / `UpdateLog`） | ✅ Connect 风格 JSON over HTTP |
 | 调度：`needs` DAG、标签匹配、原子抢占 | ✅ 上游失败时下游标 `skipped` 而非永久阻塞 |
 | 日志流：增量提交 + 服务端 ack 定义投递 | ✅ 重复窗口幂等，跳跃窗口被拒 |
-| **带确认的停止**：请求 → 确认 → 超时强杀 | ✅ 台账区分 `cleanup_ran=true/false` |
+| **带确认的停止**：请求 → 确认 → 超时强杀 | ✅ 台账区分 `cleanup_ran=true/false`；被打断的步骤记 `cancelled` 而非 `failure` |
 | 平台级默认超时 | ✅ 作者可下调，不可遗漏 |
-| `uses:` action | ⛔ P0b（需 vendor `gitea/runner` 的 `act/`） |
-| 容器执行 | ⛔ 本机未装 Docker，当前走 host 模式 |
-| 状态回写 GitHub Checks API（#47） | ⛔ P0b |
+| **`uses:` action** | ✅ `actions/checkout@v4` + `actions/setup-node@v4` 已端到端跑通 |
+| **容器执行** | ✅ `ubuntu-latest:docker://…` 起容器；`self-hosted:host` 跑宿主机；同一 runner 兼顾 |
+| 表达式、`::group::`、`::error::`、矩阵、`services`、composite action | ✅ 由 act 承担（见 L2） |
+| 步骤时间线（名称 / 结果 / 耗时 / 日志区间） | ✅ 落库并在 CLI 展示 |
+| 密钥注入与作用域 | ✅ 派发时注入，不落库；日志只打印密钥名 |
+| 状态回写 GitHub Checks API（#47） | ⛔ 下一项，也是挂上现有 PR 流程的前提 |
+| 产物上传 / 下载、缓存 | ⛔ P1（act 自带本地服务端，协议不用重设计） |
+
+### 两个已知缺口（不是疏忽，是已知边界）
+
+**`GITHUB_API_URL` 对 github.com 是错的。** `gitea/runner` v1.0.8 在构造步骤环境时硬编码了
+Gitea 的 API 形状（`<forge>/api/v1`，且把 `GITHUB_GRAPHQL_URL` 置空），没有留配置开关。
+克隆代码的步骤不受影响（走 `GITHUB_SERVER_URL`，已正确）；调用 GitHub REST API 的步骤会受影响。
+修它意味着把 act 那棵树接管过来自己维护，而不是继续跟上游——这是产品决策，不是补丁，
+见 charter 的 (a)/(b) 分工。
+
+**host 模式的 job 会继承 runner 进程的整个环境变量。** 这是 act host 模式的行为，
+GitHub 的 self-hosted runner 同样如此。默认标签里 `self-hosted:host` 是开着的，
+所以运行不可信代码的 runner 必须是独立主机——这正是 `agent-worker/README.md` 里那条规矩。
+容器 job 不受影响。此外 **daemon socket 默认不挂进容器**（`-mount-docker-socket` 显式开启）：
+拿到 host daemon 的步骤等于跳出了它自己的沙箱。
 
 ### 两条设计不要"顺手简化"掉
 
@@ -147,7 +176,7 @@ internal/
   protocol/                runner.v1 线契约
   store/                   SQLite：runs / jobs / runners / logs
   server/                  HTTP 路由与回收器
-  runner/                  取活循环、host 执行器、日志发运
+  runner/                  取活循环、act 执行器、标签路由、日志发运
   workflow/                workflow YAML 解析与校验
 examples/
 docs/
