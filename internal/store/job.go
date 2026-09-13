@@ -441,8 +441,14 @@ func (s *Store) Overdue(ctx context.Context, graceSeconds int) ([]OverdueJob, er
 			return nil, err
 		}
 		req, ack := parseTS(stopReq), parseTS(stopAck)
-		if req != nil && ack == nil && now.Sub(*req) > time.Duration(graceSeconds)*time.Second {
-			out = append(out, OverdueJob{ID: id, Reason: "stop_unacked", StopRequestedAt: req})
+		if req != nil {
+			// A stop has already been asked for. Reporting the timeout again
+			// every sweep would warn seven times about one event while the
+			// grace period runs out, and an alert that repeats itself is an
+			// alert people learn to scroll past.
+			if ack == nil && now.Sub(*req) > time.Duration(graceSeconds)*time.Second {
+				out = append(out, OverdueJob{ID: id, Reason: "stop_unacked", StopRequestedAt: req})
+			}
 			continue
 		}
 		if st := parseTS(started); st != nil && now.Sub(*st) > time.Duration(timeout)*time.Minute {

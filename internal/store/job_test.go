@@ -219,3 +219,62 @@ func TestCancelInProgressAsksTheRunningJobToStop(t *testing.T) {
 		t.Error("the run settled before its job acknowledged; a stop you cannot confirm is not a stop")
 	}
 }
+
+// An alert that repeats itself is an alert people learn to scroll past. Once a
+// stop has been asked for, the timeout that caused it must stop re-reporting.
+func TestOverdueReportsATimeoutOnlyUntilItAsksForAStop(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := newRunner(t, st, []string{"self-hosted"}, nil)
+
+	runID, err := st.CreateRun(ctx, Run{Repo: "feed-mob/app", WorkflowName: "w"},
+		[]NewJob{{Key: "slow", Payload: "p", RunsOn: []string{"self-hosted"}, TimeoutMinutes: 1}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	job, err := st.ClaimJob(ctx, r)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	_ = runID
+
+	// Pretend the job started two minutes ago, past its one-minute timeout.
+	if _, err := st.db.ExecContext(ctx, `UPDATE jobs SET started_at = ? WHERE id = ?`,
+		ts(time.Now().UTC().Add(-2*time.Minute)), job.ID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	due, err := st.Overdue(ctx, 30)
+	if err != nil {
+		t.Fatalf("overdue: %v", err)
+	}
+	if len(due) != 1 || due[0].Reason != "timeout" {
+		t.Fatalf("first sweep = %+v, want one timeout", due)
+	}
+	if err := st.RequestStop(ctx, job.ID, "reaper", "timeout"); err != nil {
+		t.Fatalf("request stop: %v", err)
+	}
+
+	// Within the grace period there is nothing new to say.
+	due, err = st.Overdue(ctx, 30)
+	if err != nil {
+		t.Fatalf("overdue: %v", err)
+	}
+	if len(due) != 0 {
+		t.Errorf("second sweep re-reported the same event: %+v", due)
+	}
+
+	// Once the grace period lapses it becomes a different event, and that one
+	// does need reporting.
+	if _, err := st.db.ExecContext(ctx, `UPDATE jobs SET stop_requested_at = ? WHERE id = ?`,
+		ts(time.Now().UTC().Add(-time.Minute)), job.ID); err != nil {
+		t.Fatalf("backdate stop: %v", err)
+	}
+	due, err = st.Overdue(ctx, 30)
+	if err != nil {
+		t.Fatalf("overdue: %v", err)
+	}
+	if len(due) != 1 || due[0].Reason != "stop_unacked" {
+		t.Fatalf("after the grace period = %+v, want stop_unacked", due)
+	}
+}
