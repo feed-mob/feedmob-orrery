@@ -433,24 +433,41 @@ type LogLine struct {
 // attempt nil means the current one. Passing an older attempt is how the log of
 // a failure survives the re-run that was meant to fix it.
 func (s *Store) Logs(ctx context.Context, jobID int64, attempt *int) ([]LogLine, error) {
+	lines, _, err := s.LogsFrom(ctx, jobID, attempt, 0)
+	return lines, err
+}
+
+// LogsFrom returns the lines from index `from` onwards, and the index the next
+// call should start at.
+//
+// Watching a running job used to mean refetching the whole log every couple of
+// seconds; on a job that prints a few megabytes that is a few megabytes every
+// couple of seconds, for one browser tab. The cursor makes following a live log
+// cost what the job actually produced since the last look.
+func (s *Store) LogsFrom(ctx context.Context, jobID int64, attempt *int, from int64) ([]LogLine, int64, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT ts, content FROM job_logs
+		SELECT idx, ts, content FROM job_logs
 		WHERE job_id = ? AND attempt = COALESCE(?, (SELECT attempt FROM jobs WHERE id = ?))
-		ORDER BY idx ASC`, jobID, attempt, jobID)
+		      AND idx >= ?
+		ORDER BY idx ASC`, jobID, attempt, jobID, from)
 	if err != nil {
-		return nil, err
+		return nil, from, err
 	}
 	defer rows.Close()
 	var out []LogLine
+	next := from
 	for rows.Next() {
-		var t, c string
-		if err := rows.Scan(&t, &c); err != nil {
-			return nil, err
+		var idx int64
+		var l LogLine
+		var at string
+		if err := rows.Scan(&idx, &at, &l.Content); err != nil {
+			return nil, from, err
 		}
-		parsed, _ := time.Parse(time.RFC3339Nano, t)
-		out = append(out, LogLine{Time: parsed, Content: c})
+		l.Time, _ = time.Parse(time.RFC3339Nano, at)
+		out = append(out, l)
+		next = idx + 1
 	}
-	return out, rows.Err()
+	return out, next, rows.Err()
 }
 
 // ----------------------------------------------------------------- reaper --
@@ -699,4 +716,56 @@ func runInTx(ctx context.Context, tx *sql.Tx, runID int64) (*Run, error) {
 		return nil, ErrNotFound
 	}
 	return &r, err
+}
+
+// CancelRun stops a whole run: the running jobs are asked to wind down, and
+// the ones that never started are marked without ceremony.
+//
+// One call rather than one per job. A five-job run needed five clicks, and the
+// fifth arrived after the second job had already picked up work nobody wanted.
+func (s *Store) CancelRun(ctx context.Context, runID int64, by, reason string) (*RunOutcome, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, runID).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if status == "done" {
+		return nil, fmt.Errorf("run %d already finished", runID)
+	}
+	now := ts(s.now())
+	if err := cancelRun(ctx, tx, runID, by, reason, now); err != nil {
+		return nil, err
+	}
+	if err := bumpTasksVersion(ctx, tx); err != nil {
+		return nil, err
+	}
+	// cancelRun settles the run only when nothing was left running; when a job
+	// is still winding down the run settles on its report instead.
+	var outcome *RunOutcome
+	var result string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT status, result FROM runs WHERE id = ?`, runID).Scan(&status, &result); err != nil {
+		return nil, err
+	}
+	if status == "done" {
+		outcome = &RunOutcome{RunID: runID, Result: result}
+		if err := promoteGroup(ctx, tx, groupOf(ctx, tx, runID)); err != nil {
+			return nil, err
+		}
+	}
+	return outcome, tx.Commit()
+}
+
+func groupOf(ctx context.Context, tx *sql.Tx, runID int64) string {
+	var g string
+	_ = tx.QueryRowContext(ctx, `SELECT concurrency_group FROM runs WHERE id = ?`, runID).Scan(&g)
+	return g
 }

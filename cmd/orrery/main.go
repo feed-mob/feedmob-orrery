@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,11 +21,13 @@ const usage = `orrery — submit workflows to an Orrery server and read what hap
 usage:
   orrery submit <workflow.yml> [--repo R] [--event E] [--ref REF] [--wait]
   orrery dispatch <repo> <workflow-file> [--ref REF] [--input k=v ...] [--wait]
-  orrery runs [--limit N]
+  orrery runs [--limit N] [--repo R] [--workflow W] [--status S] [--result R]
+              [--event E] [--actor A] [--branch B]
   orrery run <id>
   orrery rerun <run-id> [--failed] [--wait]
   orrery logs <job-id> [--attempt N]
   orrery stop <job-id>
+  orrery cancel <run-id>
 
 env:
   ORRERY_API_TOKEN   the server's -api-token; every command below needs it
@@ -54,6 +57,8 @@ func main() {
 		err = showLogs(base, os.Args[2:])
 	case "stop":
 		err = stopJob(base, os.Args[2:])
+	case "cancel":
+		err = cancelRun(base, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -130,6 +135,23 @@ func submit(base string, args []string) error {
 		return nil
 	}
 	return waitForRun(base, out.RunID)
+}
+
+// cancelRun stops a whole run in one call, rather than one stop per job.
+func cancelRun(base string, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: orrery cancel <run-id>")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("bad run id %q", args[0])
+	}
+	var out map[string]any
+	if err := post(fmt.Sprintf("%s/api/runs/%d/cancel?by=cli", base, id), map[string]any{}, &out); err != nil {
+		return err
+	}
+	fmt.Printf("run %d 已请求取消——runner 收尾后确认\n", id)
+	return nil
 }
 
 // rerun starts a finished run over without a new commit.
@@ -310,25 +332,38 @@ type runSummary struct {
 }
 
 func listRuns(base string, args []string) error {
-	limit := flagValue(args, "limit", "20")
-	var runs []struct {
-		ID           int64  `json:"ID"`
-		Repo         string `json:"Repo"`
-		WorkflowName string `json:"WorkflowName"`
-		Event        string `json:"Event"`
-		Status       string `json:"Status"`
-		Result       string `json:"Result"`
+	q := url.Values{"limit": {flagValue(args, "limit", "20")}}
+	// The same filters the dashboard offers, so a question answered in one
+	// place can be answered the same way in the other.
+	for _, name := range []string{"repo", "workflow", "status", "result", "event", "actor", "branch"} {
+		if v := flagValue(args, name, ""); v != "" {
+			q.Set(name, v)
+		}
 	}
-	if err := get(base+"/api/runs?limit="+limit, &runs); err != nil {
+	var page struct {
+		Runs []struct {
+			ID           int64  `json:"ID"`
+			Repo         string `json:"Repo"`
+			WorkflowName string `json:"WorkflowName"`
+			Event        string `json:"Event"`
+			Status       string `json:"Status"`
+			Result       string `json:"Result"`
+		} `json:"Runs"`
+		Total int `json:"Total"`
+	}
+	if err := get(base+"/api/runs?"+q.Encode(), &page); err != nil {
 		return err
 	}
-	if len(runs) == 0 {
-		fmt.Println("no runs yet")
+	if len(page.Runs) == 0 {
+		fmt.Println("no runs matched")
 		return nil
 	}
 	fmt.Printf("%-6s %-12s %-26s %-10s %s\n", "RUN", "STATUS", "WORKFLOW", "EVENT", "RESULT")
-	for _, r := range runs {
+	for _, r := range page.Runs {
 		fmt.Printf("%-6d %-12s %-26s %-10s %s\n", r.ID, r.Status, truncate(r.WorkflowName, 26), r.Event, r.Result)
+	}
+	if page.Total > len(page.Runs) {
+		fmt.Printf("\n显示 %d 条，共 %d 条匹配\n", len(page.Runs), page.Total)
 	}
 	return nil
 }

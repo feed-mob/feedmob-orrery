@@ -78,9 +78,49 @@ pre.log {
   white-space: pre-wrap; word-break: break-word; background: var(--panel);
 }
 pre.log .t { color: var(--dim); }
-pre.log .err { color: var(--fail); }
 pre.log .grp { color: var(--accent); }
 .empty { padding: 28px 14px; text-align: center; color: var(--dim); }
+
+nav { display: flex; gap: 14px; }
+nav a {
+  text-decoration: none; font-size: 12px; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--dim); padding-bottom: 2px;
+}
+nav a:hover { color: var(--ink); }
+nav a.on { color: var(--accent); border-bottom: 2px solid var(--accent); }
+
+.row { display: flex; align-items: center; gap: 10px; }
+.row.wrap { flex-wrap: wrap; }
+.row.tight { margin-top: 6px; }
+.pad { padding: 12px 14px; }
+.pad-x { padding: 0 14px; }
+.pad-b { padding-bottom: 14px; }
+.field { padding: 5px 0; }
+.field label { min-width: 120px; font-size: 13px; }
+label { color: var(--dim); font-size: 13px; }
+
+input.text, select.text {
+  font: inherit; font-size: 13px; padding: 6px 9px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  min-width: 180px;
+}
+input.narrow, select.narrow { min-width: 120px; }
+input.text:focus, select.text:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+button.danger { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 40%, var(--line)); }
+
+/* Log viewer */
+.logwrap { border-top: 1px solid var(--line); }
+.logbar { padding: 8px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.logline { white-space: pre-wrap; word-break: break-word; }
+.logline.err { color: var(--fail); }
+.logline.dim { color: var(--dim); }
+.logline.engine { color: var(--warn); }
+.grouphead {
+  cursor: pointer; user-select: none; padding: 1px 0;
+}
+.grouphead:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.groupbody { padding-left: 14px; border-left: 1px solid var(--line); margin-left: 3px; }
+mark { background: color-mix(in srgb, var(--warn) 45%, transparent); color: inherit; border-radius: 2px; }
 /* On a phone the secondary columns are what you scroll past to reach the
    verdict, so drop them rather than make the whole table slide. */
 @media (max-width: 720px) {
@@ -95,11 +135,12 @@ pre.log .grp { color: var(--accent); }
 <body>
 <header>
   <h1><a href="#/">ORRERY</a></h1>
+  <nav id="nav"></nav>
   <span class="sub" id="crumb"></span>
   <span class="spacer"></span>
   <span class="sub" id="tick"></span>
 </header>
 <main id="app"><div class="empty">加载中…</div></main>
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>

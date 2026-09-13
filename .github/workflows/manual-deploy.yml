@@ -1,0 +1,41 @@
+# 只能手动触发的示例 workflow：给 Orrery 面板上的「手动触发」表单一个可演示的对象，
+# 同时也是带类型参数的 workflow_dispatch 长什么样的参考。
+#
+# 只有 workflow_dispatch，没有 push/pull_request——所以它不会因为提交而自动运行，
+# 在 GitHub Actions 和 Orrery 上都一样。它只回显参数，不碰任何东西。
+name: Manual Deploy (demo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 部署到哪个环境
+        required: true
+        type: choice
+        options: [staging, production]
+      version:
+        description: 版本号或镜像 tag
+        type: string
+        default: latest
+      dry_run:
+        description: 只打印不执行
+        type: boolean
+        default: true
+      replicas:
+        description: 实例数
+        type: number
+        default: 2
+
+jobs:
+  show:
+    name: Show what was asked for
+    runs-on: [self-hosted]
+    timeout-minutes: 5
+    steps:
+      - name: Echo the inputs
+        run: |
+          echo "environment = ${{ inputs.environment }}"
+          echo "version     = ${{ inputs.version }}"
+          echo "dry_run     = ${{ inputs.dry_run }}"
+          echo "replicas    = ${{ inputs.replicas }}"
+          echo "（示例 workflow，不做任何实际部署）"

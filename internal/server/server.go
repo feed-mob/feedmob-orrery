@@ -178,7 +178,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/whoami", s.handleWhoAmI)
 	s.mux.HandleFunc("POST /api/dispatch", s.operator(s.handleDispatch))
 	s.mux.HandleFunc("POST /api/runs", s.operator(s.handleSubmitRun))
-	s.mux.HandleFunc("GET /api/runs", s.operator(s.handleListRuns))
+	s.mux.HandleFunc("GET /api/runs", s.operator(s.handleQueryRuns))
+	s.mux.HandleFunc("GET /api/facets", s.operator(s.handleFacets))
+	s.mux.HandleFunc("GET /api/runners", s.operator(s.handleRunners))
+	s.mux.HandleFunc("GET /api/schedules", s.operator(s.handleSchedules))
+	s.mux.HandleFunc("GET /api/workflows", s.operator(s.handleWorkflowsOf))
+	s.mux.HandleFunc("GET /api/config", s.operator(s.handleConfig))
+	s.mux.HandleFunc("POST /api/runs/{id}/cancel", s.operator(s.handleCancelRun))
 	s.mux.HandleFunc("GET /api/runs/{id}", s.operator(s.handleGetRun))
 	s.mux.HandleFunc("POST /api/runs/{id}/rerun", s.operator(s.handleRerun))
 	s.mux.HandleFunc("GET /api/jobs/{id}/logs", s.operator(s.handleJobLogs))
@@ -617,16 +623,6 @@ func orDefault(v, def string) string {
 	return v
 }
 
-func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	runs, err := s.st.ListRuns(r.Context(), limit)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, runs)
-}
-
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -690,11 +686,18 @@ func (s *Server) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		attempt = &n
 	}
-	lines, err := s.st.Logs(r.Context(), id, attempt)
+	// ?from=N returns only what arrived after line N and reports where to
+	// resume. Following a running job used to mean refetching the whole log
+	// every couple of seconds.
+	from, _ := strconv.ParseInt(r.URL.Query().Get("from"), 10, 64)
+	lines, next, err := s.st.LogsFrom(r.Context(), id, attempt, from)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// The cursor rides in a header so the body stays plain text: `curl` on this
+	// endpoint should still print a log, not JSON someone has to unwrap.
+	w.Header().Set("X-Orrery-Next", strconv.FormatInt(next, 10))
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	for _, l := range lines {
 		fmt.Fprintf(w, "%s %s\n", l.Time.UTC().Format(time.RFC3339), l.Content)
