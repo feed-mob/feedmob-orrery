@@ -104,6 +104,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- which is exactly the moment you want to keep looking at it.
     attempt INTEGER NOT NULL DEFAULT 1,
 
+    -- Automatic retry. GitHub has none: a deploy that failed because a registry
+    -- timed out waits for a human to press a button. retry_after is when this
+    -- job may be handed out again, which is why ClaimJob checks it.
+    retry_max     INTEGER NOT NULL DEFAULT 1,
+    retry_backoff INTEGER NOT NULL DEFAULT 0,
+    retry_on      TEXT    NOT NULL DEFAULT '[]',
+    retry_after   TEXT,
+
     UNIQUE (run_id, job_key)
 );
 

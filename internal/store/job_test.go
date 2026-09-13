@@ -405,3 +405,116 @@ func TestPruneWithNoWindowKeepsEverything(t *testing.T) {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
 }
+
+// GitHub has no job retry at all: a deploy that failed because a registry timed
+// out waits for a human to press a button.
+func TestRetryRequeuesInsteadOfSettling(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := newRunner(t, st, []string{"self-hosted"}, nil)
+
+	runID, err := st.CreateRun(ctx, Run{Repo: "r", WorkflowName: "w"}, []NewJob{
+		{Key: "flaky", Payload: "p", RunsOn: []string{"self-hosted"},
+			RetryMax: 3, RetryBackoff: 0, RetryOn: []string{"failure"}},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	job, err := st.ClaimJob(ctx, r)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// First failure: back to the queue, and the run must not settle — nothing
+	// downstream should read a verdict that is about to be replaced.
+	outcome, err := st.FinishJob(ctx, job.ID, "failure")
+	if err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if outcome != nil {
+		t.Fatalf("the run settled on a retryable failure: %+v", outcome)
+	}
+	sum, _ := st.RunByID(ctx, runID)
+	if sum.Jobs[0].Status != "queued" || sum.Jobs[0].Attempt != 2 {
+		t.Fatalf("job = %s attempt %d, want queued attempt 2", sum.Jobs[0].Status, sum.Jobs[0].Attempt)
+	}
+	if sum.Run.Status == "done" {
+		t.Error("the run settled while a retry was pending")
+	}
+
+	// Second failure.
+	if _, err := st.ClaimJob(ctx, r); err != nil {
+		t.Fatalf("claim attempt 2: %v", err)
+	}
+	if outcome, err = st.FinishJob(ctx, job.ID, "failure"); err != nil || outcome != nil {
+		t.Fatalf("attempt 2: outcome=%+v err=%v", outcome, err)
+	}
+
+	// Third is the last: max-attempts counts the first try, so now it settles.
+	if _, err := st.ClaimJob(ctx, r); err != nil {
+		t.Fatalf("claim attempt 3: %v", err)
+	}
+	outcome, err = st.FinishJob(ctx, job.ID, "failure")
+	if err != nil {
+		t.Fatalf("attempt 3: %v", err)
+	}
+	if outcome == nil || outcome.Result != "failure" {
+		t.Fatalf("the run did not settle after the last attempt: %+v", outcome)
+	}
+	sum, _ = st.RunByID(ctx, runID)
+	if sum.Jobs[0].Attempt != 3 {
+		t.Errorf("attempt = %d, want 3", sum.Jobs[0].Attempt)
+	}
+}
+
+// The operator, the reaper or a concurrency group decided this job should stop.
+// Starting it again is arguing with them.
+func TestCancelledIsNeverRetried(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := newRunner(t, st, []string{"self-hosted"}, nil)
+	if _, err := st.CreateRun(ctx, Run{Repo: "r", WorkflowName: "w"}, []NewJob{
+		{Key: "a", Payload: "p", RunsOn: []string{"self-hosted"},
+			RetryMax: 5, RetryOn: []string{"failure", "cancelled"}},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	job, _ := st.ClaimJob(ctx, r)
+	outcome, err := st.FinishJob(ctx, job.ID, "cancelled")
+	if err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if outcome == nil {
+		t.Fatal("a cancelled job was put back in the queue")
+	}
+}
+
+// A backoff that has not elapsed must keep the job out of a runner's hands, or
+// the wait buys nothing.
+func TestRetryBackoffHoldsTheJobBack(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := newRunner(t, st, []string{"self-hosted"}, nil)
+	if _, err := st.CreateRun(ctx, Run{Repo: "r", WorkflowName: "w"}, []NewJob{
+		{Key: "a", Payload: "p", RunsOn: []string{"self-hosted"},
+			RetryMax: 3, RetryBackoff: 3600, RetryOn: []string{"failure"}},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	job, _ := st.ClaimJob(ctx, r)
+	if _, err := st.FinishJob(ctx, job.ID, "failure"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if _, err := st.ClaimJob(ctx, r); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a job inside its backoff was handed out: %v", err)
+	}
+	// Once the wait has elapsed it becomes claimable again.
+	if _, err := st.db.ExecContext(ctx,
+		`UPDATE jobs SET retry_after = ? WHERE id = ?`,
+		ts(time.Now().UTC().Add(-time.Minute)), job.ID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	if _, err := st.ClaimJob(ctx, r); err != nil {
+		t.Fatalf("claim after the backoff: %v", err)
+	}
+}

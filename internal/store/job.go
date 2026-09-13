@@ -124,9 +124,51 @@ func (s *Store) FinishJob(ctx context.Context, jobID int64, result string) (*Run
 
 	now := ts(s.now())
 	var runID int64
-	if err := tx.QueryRowContext(ctx, `SELECT run_id FROM jobs WHERE id = ?`, jobID).Scan(&runID); err != nil {
+	var attempt, retryMax, retryBackoff int
+	var retryOn string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT run_id, attempt, retry_max, retry_backoff, retry_on FROM jobs WHERE id = ?`,
+		jobID).Scan(&runID, &attempt, &retryMax, &retryBackoff, &retryOn); err != nil {
 		return nil, err
 	}
+
+	// A job the author asked to retry goes back to the queue instead of
+	// settling. The run stays in flight, so nothing downstream reads a verdict
+	// that is about to be replaced.
+	if retryable(result, attempt, retryMax, decodeStrings(retryOn)) {
+		// Exponential: a registry or an SSH host that just refused you is not
+		// ready one second later, and three immediate retries are one failure
+		// reported three times.
+		wait := time.Duration(retryBackoff) * time.Second * (1 << (attempt - 1))
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs SET attempt = attempt + 1, status = 'queued', result = '', runner_id = NULL,
+			                started_at = NULL, stopped_at = NULL, retry_after = ?,
+			                stop_requested_at = NULL, stop_requested_by = '', stop_reason = '',
+			                stop_acked_at = NULL, force_terminated = 0, cleanup_ran = 0
+			WHERE id = ?`, ts(s.now().Add(wait)), jobID); err != nil {
+			return nil, err
+		}
+		// The next attempt's log stream starts at 0; the failed one is kept
+		// under its own attempt, which is the point of retrying visibly.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE job_log_state SET ack_index = 0, no_more = 0, truncated = 0 WHERE job_id = ?`,
+			jobID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM job_outputs WHERE job_id = ?`, jobID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE runners SET status = 'idle' WHERE id = (SELECT runner_id FROM jobs WHERE id = ?)`,
+			jobID); err != nil {
+			return nil, err
+		}
+		if err := bumpTasksVersion(ctx, tx); err != nil {
+			return nil, err
+		}
+		return nil, tx.Commit()
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET status = 'done', result = ?, stopped_at = COALESCE(stopped_at, ?) WHERE id = ?`,
 		result, now, jobID); err != nil {
@@ -768,4 +810,37 @@ func groupOf(ctx context.Context, tx *sql.Tx, runID int64) string {
 	var g string
 	_ = tx.QueryRowContext(ctx, `SELECT concurrency_group FROM runs WHERE id = ?`, runID).Scan(&g)
 	return g
+}
+
+// retryable decides whether a settled job goes back to the queue.
+//
+// A cancellation is never retried, whatever the workflow says: the operator,
+// the reaper or a concurrency group decided this job should stop, and starting
+// it again is arguing with them.
+func retryable(result string, attempt, max int, on []string) bool {
+	if max <= 1 || attempt >= max || result == "cancelled" {
+		return false
+	}
+	for _, want := range on {
+		if want == result {
+			return true
+		}
+	}
+	return false
+}
+
+// RetriesDue reports whether any job is now past its backoff and waiting to be
+// handed out.
+//
+// A runner parks in a long poll until something wakes it, so without this the
+// wait is the poll interval rather than the backoff the author asked for — a
+// two-second backoff took twenty seconds, and the number in the workflow was a
+// suggestion rather than a fact.
+func (s *Store) RetriesDue(ctx context.Context) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE status = 'queued' AND retry_after IS NOT NULL AND retry_after <= ?`,
+		ts(s.now())).Scan(&n)
+	return n > 0, err
 }

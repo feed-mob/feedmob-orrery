@@ -114,7 +114,7 @@ func (s *Store) Rerun(ctx context.Context, runID int64, failedOnly bool) (int, e
 		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs SET attempt = attempt + 1, status = ?, result = '', runner_id = NULL,
-			                started_at = NULL, stopped_at = NULL,
+			                started_at = NULL, stopped_at = NULL, retry_after = NULL,
 			                stop_requested_at = NULL, stop_requested_by = '', stop_reason = '',
 			                stop_acked_at = NULL, force_terminated = 0, cleanup_ran = 0
 			WHERE id = ?`, next, j.id); err != nil {

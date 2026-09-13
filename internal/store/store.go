@@ -90,6 +90,10 @@ func addColumns(db *sql.DB) error {
 		`ALTER TABLE runs ADD COLUMN run_attempt INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE job_log_state ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN retry_max INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE jobs ADD COLUMN retry_backoff INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN retry_on TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE jobs ADD COLUMN retry_after TEXT`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("%s: %w", stmt, err)
@@ -350,6 +354,10 @@ type NewJob struct {
 	RunsOn         []string
 	Payload        string
 	TimeoutMinutes int
+	// RetryMax counts the first attempt; 1 or 0 means no retry.
+	RetryMax     int
+	RetryBackoff int
+	RetryOn      []string
 }
 
 // Run is a stored workflow run.
@@ -465,9 +473,11 @@ func (s *Store) CreateRun(ctx context.Context, run Run, jobs []NewJob) (int64, e
 			timeout = 60
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO jobs (run_id, job_key, name, needs, runs_on, payload, status, timeout_minutes, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			runID, j.Key, j.Name, encodeJSON(j.Needs), encodeJSON(j.RunsOn), j.Payload, status, timeout, now); err != nil {
+			INSERT INTO jobs (run_id, job_key, name, needs, runs_on, payload, status, timeout_minutes, created_at,
+			                  retry_max, retry_backoff, retry_on)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			runID, j.Key, j.Name, encodeJSON(j.Needs), encodeJSON(j.RunsOn), j.Payload, status, timeout, now,
+			max(j.RetryMax, 1), j.RetryBackoff, encodeJSON(j.RetryOn)); err != nil {
 			return 0, fmt.Errorf("insert job %s: %w", j.Key, err)
 		}
 	}
@@ -520,7 +530,8 @@ func (s *Store) ClaimJob(ctx context.Context, r *Runner) (*Job, error) {
 		SELECT j.id, j.run_id, j.job_key, j.name, j.needs, j.runs_on, j.payload, j.timeout_minutes
 		FROM jobs j JOIN runs r ON r.id = j.run_id
 		WHERE j.status = 'queued' AND r.status != 'pending'
-		ORDER BY j.id ASC`)
+		      AND (j.retry_after IS NULL OR j.retry_after <= ?)
+		ORDER BY j.id ASC`, ts(s.now()))
 	if err != nil {
 		return nil, err
 	}

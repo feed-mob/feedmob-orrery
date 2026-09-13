@@ -45,8 +45,10 @@ type Job struct {
 	TimeoutMinutes int               `yaml:"timeout-minutes"`
 	Env            map[string]string `yaml:"env"`
 	If             string            `yaml:"if"`
-	Steps          []Step            `yaml:"steps"`
-	Outputs        map[string]string `yaml:"outputs"`
+	// Retry is Orrery's own key; GitHub has no job retry at all.
+	Retry   *Retry            `yaml:"retry"`
+	Steps   []Step            `yaml:"steps"`
+	Outputs map[string]string `yaml:"outputs"`
 }
 
 // Step is one step of a job.
@@ -134,6 +136,9 @@ func Parse(data []byte) (*Workflow, error) {
 		}
 		if job.Name == "" {
 			job.Name = key
+		}
+		if err := job.Retry.normalise(key); err != nil {
+			return nil, err
 		}
 		if job.TimeoutMinutes <= 0 {
 			job.TimeoutMinutes = DefaultTimeoutMinutes

@@ -166,6 +166,7 @@ forge（默认 `https://github.com`），它和 runner 的 `-actions-url`（`use
 | **仓库白名单** | ✅ `-repos`；签名不等于"这个仓库归我们管" |
 | **API / UI 认证** | ✅ 无 token 拒绝启动；bearer / HttpOnly 会话 cookie；webhook 走签名、healthz 开放 |
 | **Web UI**（#32） | ✅ 编译进二进制，无 CDN；run 列表、步骤时间线、日志、重跑、停止；深色与手机适配 |
+| **自动重试**（#66） | ✅ job 级 `retry:`，指数退避；GitHub 完全没有这个 |
 | **重跑**（#53） | ✅ `rerun [--failed]`：run 保持不变、attempt +1；成功 job 的产物与 outputs 留着给被重跑的用 |
 | `permissions:` 收窄 token（#45） | ⛔ 需要先有 GitHub App 才能铸造收窄的 token |
 | RBAC：谁能触发 / 审批 / 看日志（#73） | ⛔ 共享令牌没有"谁"，需要先定身份方案 |
@@ -316,6 +317,28 @@ GitHub App，再升级到 Checks API 拿 diff 行内注解。
 那几行，不是每两秒把整份日志重新拉一遍。渲染上限 5000 行，超出给「纯文本」链接。
 
 只在有东西真的在动的时候才轮询——没人看的时候还在敲自己控制面的面板，本身就是一次故障。
+
+### 自动重试
+
+**GitHub 完全没有 job 重试**：一次因为 registry 超时失败的部署，要等人回来按按钮。
+这是人回去按按钮最常见的理由，也是机器比人做得好的那件事。
+
+```yaml
+jobs:
+  deploy:
+    retry:
+      max-attempts: 3        # 含第一次
+      backoff-seconds: 15    # 第二次前等这么久，之后翻倍
+      on: [failure]          # 默认就是 failure
+```
+
+有意做成 **job 级而不是步骤级**：跑到一半的步骤不能安全续上，而 job 重跑是从第一步
+在干净工作区重来——这是唯一对"它到底重复了什么"诚实的重试。
+
+`cancelled` **永远不重试**，写进 `on:` 会在解析时被拒。取消是人、回收器或并发组决定
+这个 job 该停，再把它拉起来是在跟他们争。
+
+每次 attempt 的日志分开归档，`orrery logs <job> --attempt N` 看得到失败那次。
 
 ### 重跑
 

@@ -608,10 +608,16 @@ func newJobsFor(wf *workflow.Workflow, source []byte) ([]store.NewJob, error) {
 		if err != nil {
 			return nil, err
 		}
-		jobs = append(jobs, store.NewJob{
+		nj := store.NewJob{
 			Key: key, Name: j.Name, Needs: j.Needs, RunsOn: j.RunsOn,
 			Payload: string(payload), TimeoutMinutes: j.TimeoutMinutes,
-		})
+		}
+		if j.Retry != nil {
+			nj.RetryMax = j.Retry.MaxAttempts
+			nj.RetryBackoff = j.Retry.BackoffSeconds
+			nj.RetryOn = j.Retry.On
+		}
+		jobs = append(jobs, nj)
 	}
 	return jobs, nil
 }
@@ -736,6 +742,13 @@ func (s *Server) RunReaper(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+		// A job whose backoff has elapsed is claimable but nobody is looking:
+		// runners park in a long poll. Waking them here is what makes the
+		// backoff the wait the author asked for rather than the poll interval.
+		if due, err := s.st.RetriesDue(ctx); err == nil && due {
+			s.wake.broadcast()
+		}
+
 		overdue, err := s.st.Overdue(ctx, int(s.cfg.StopGrace/time.Second))
 		if err != nil {
 			s.log.Error("reaper sweep failed", "err", err)
