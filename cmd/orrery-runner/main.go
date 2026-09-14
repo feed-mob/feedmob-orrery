@@ -44,7 +44,11 @@ func main() {
 		cachePort      = flag.Int("cache-port", 0, "port for the cache server; 0 lets the OS choose")
 		noArtifacts    = flag.Bool("no-artifacts", false, "do not run the artifact server; actions/upload-artifact then fails rather than silently storing nothing")
 		noCache        = flag.Bool("no-cache", false, "do not run the cache server; actions/cache then fails")
-		verbose        = flag.Bool("v", false, "debug logging")
+		cacheMaxGB     = flag.Float64("cache-max-gb", 10,
+			"cap the cache directory at this many GB, evicting least-recently-used entries; 0 disables the cap. "+
+				"act evicts on age alone, so without this a buildx mode=max build grows until the disk is full. "+
+				"The default matches GitHub's own 10 GB per-repository cache")
+		verbose = flag.Bool("v", false, "debug logging")
 	)
 	flag.Parse()
 
@@ -108,6 +112,7 @@ func main() {
 		ServiceAddr:       *svcAddr,
 		ArtifactPort:      *artifactPort,
 		CachePort:         *cachePort,
+		CacheMaxBytes:     int64(*cacheMaxGB * (1 << 30)),
 		NoArtifacts:       *noArtifacts,
 		NoCache:           *noCache,
 	}, log)

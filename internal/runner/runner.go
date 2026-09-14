@@ -51,6 +51,11 @@ type Options struct {
 	NoArtifacts bool
 	NoCache     bool
 
+	// CacheMaxBytes caps the cache directory. act evicts on age alone, so
+	// without this a buildx `mode=max` workflow grows until the disk is full.
+	// Zero means no cap, which is act's behaviour and not a good default.
+	CacheMaxBytes int64
+
 	// ArtifactURL and ArtifactToken are filled in at startup from the control
 	// plane's answer, not from a flag. The operator configures the shared store
 	// once, on the server; a runner discovers it. That way a fleet cannot end
@@ -114,12 +119,13 @@ var Capabilities = []string{protocol.CapabilityCancelling}
 
 // Runner polls for work and executes it.
 type Runner struct {
-	cl    *Client
-	opts  Options
-	log   *slog.Logger
-	exec  *actExecutor
-	svc   *services
-	sweep *sweeper
+	cl       *Client
+	opts     Options
+	log      *slog.Logger
+	exec     *actExecutor
+	svc      *services
+	sweep    *sweeper
+	cacheCap *cacheLimit
 }
 
 // New builds a runner.
@@ -140,6 +146,11 @@ func New(cl *Client, opts Options, log *slog.Logger) *Runner {
 		opts:  opts,
 		log:   log,
 		sweep: &sweeper{prefix: prefix, log: log},
+		cacheCap: &cacheLimit{
+			dir: filepath.Join(opts.WorkDir, "cache"),
+			max: opts.CacheMaxBytes,
+			log: log,
+		},
 		exec: &actExecutor{
 			containerPrefix: prefix,
 			labels:          opts.Labels,
@@ -177,6 +188,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Whatever the last run of this runner left behind is ours to clear, and
 	// nobody else's to notice.
 	r.sweep.sweep(ctx, "startup")
+	r.cacheCap.sweep(ctx, "startup")
 
 	names := r.opts.Labels.Names()
 	if _, err = r.cl.Declare(ctx, &protocol.DeclareRequest{
@@ -344,6 +356,7 @@ func (r *Runner) execute(ctx context.Context, task *protocol.Task) error {
 	// only tidies on restart accumulates the leftovers of every job the daemon
 	// stalled on.
 	r.sweep.sweep(cleanupCtx, "task complete")
+	r.cacheCap.sweep(cleanupCtx, "task complete")
 
 	r.log.Info("task complete", "task", task.ID, "result", final, "stopped", wasStopped, "steps", len(steps))
 	r.finish(cleanupCtx, task.ID, final, steps, outputs, ackedAt)

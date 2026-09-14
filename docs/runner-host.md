@@ -36,7 +36,7 @@ GitHub 每次跑完把整台机器扔掉，所以 14 GB 够。**自建 runner �
 | 占地方的东西 | 大概 |
 |---|---|
 | `catthehacker/ubuntu:act-22.04`（job 的基础镜像） | ~3 GB 解压后 |
-| Docker 层缓存（buildx `mode=max` 会**故意**把每一层都留下） | 10–30 GB，只增不减 |
+| Docker 层缓存（buildx `mode=max`） | **已封顶 10 GB**，见下 |
 | 构建出来的镜像，每次一个 | 每个几百 MB |
 | action 缓存、npm 缓存、工作目录 | 几 GB |
 
@@ -100,6 +100,12 @@ IO。这也是你们自己写下的规矩：**必须是隔离主机，绝不能�
 ## 配好之后，已知要踩的三个坑
 
 不影响选规格，但配环境的人会撞上：
+
+0. **缓存容量已经封顶，不用再操心。** `build-image.yml` 的 `cache-to: type=gha,mode=max`
+   是多阶段 Dockerfile 的正确写法（`npm ci` / `npm run build` 都在被丢弃的 `build`
+   阶段，用默认的 `mode=min` 等于一层都不缓存）。act 的淘汰只看时间不看容量，所以
+   Orrery 自己加了上限，默认 10 GB、对齐 GitHub，超了按最久未使用往下删：
+   `-cache-max-gb`。**磁盘规格里那 10–30 GB 的不确定性就是被这条消掉的。**
 
 1. **`cache-from: type=gha` 可能不生效。** `build-image.yml` 用 GitHub 的缓存后端存
    Docker 层。Orrery 的缓存服务端实现的是 v3 协议（`_apis/artifactcache`），新版 buildx
