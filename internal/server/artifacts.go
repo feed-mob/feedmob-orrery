@@ -5,11 +5,14 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -253,4 +256,76 @@ func (s *Server) handleArtifactSession(w http.ResponseWriter, r *http.Request) {
 	s.artifacts.register(runner.ID, req.Token)
 	s.log.Info("artifact credential registered", "runner", runner.ID, "url", s.artifacts.URL())
 	writeJSON(w, http.StatusOK, map[string]string{"url": s.artifacts.URL()})
+}
+
+// prune deletes the artifacts of runs that no longer exist.
+//
+// Retention removes run rows after -retention; without this their files stayed
+// on disk forever. A control plane's artifact directory then grows without
+// bound, which on a box that shares a disk with anything else is the same
+// failure the cache cap exists to prevent.
+//
+// Deliberately *not* a byte cap, unlike the cache. A cache miss costs a slower
+// build and nothing else, so evicting the least recently used entry is free. A
+// missing artifact fails the job that wanted it, with no fallback — so the only
+// safe rule is "as long as the run it belongs to", and the operator tunes it
+// through -retention rather than through a size they have to guess.
+//
+// Orphans rather than ages: the run table is the authority on what still
+// exists, so this also sweeps up artifacts of runs deleted any other way.
+func (a *ArtifactStore) prune(ctx gocontext.Context, alive func(gocontext.Context, int64) (bool, error)) (int, int64, error) {
+	if a == nil {
+		return 0, 0, nil
+	}
+	dirs, err := os.ReadDir(a.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+	var removed int
+	var freed int64
+	for _, d := range dirs {
+		if ctx.Err() != nil {
+			break
+		}
+		// Every top-level entry is a run id — act keys its storage that way
+		// (artifacts/server.go:122). Anything else did not come from the
+		// protocol and is left alone rather than guessed at.
+		runID, err := strconv.ParseInt(d.Name(), 10, 64)
+		if err != nil || !d.IsDir() {
+			continue
+		}
+		ok, err := alive(ctx, runID)
+		if err != nil {
+			return removed, freed, err
+		}
+		if ok {
+			continue
+		}
+		path := filepath.Join(a.dir, d.Name())
+		size := dirSize(path)
+		if err := os.RemoveAll(path); err != nil {
+			a.log.Warn("cannot remove the artifacts of a pruned run", "run", runID, "err", err)
+			continue
+		}
+		removed++
+		freed += size
+	}
+	return removed, freed, nil
+}
+
+func dirSize(path string) int64 {
+	var total int64
+	_ = filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil //nolint:nilerr // a file we cannot stat just does not count
+		}
+		if info, err := d.Info(); err == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
 }

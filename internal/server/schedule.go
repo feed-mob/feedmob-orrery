@@ -162,6 +162,14 @@ func (s *Server) RunPruner(ctx context.Context) {
 		} else if runs > 0 {
 			s.log.Info("pruned runs past the retention window", "runs", runs, "retention", s.cfg.Retention)
 		}
+		// Then the artifacts of whatever that just removed. Ordered after the
+		// run prune and not before it, so a run pruned this cycle has its files
+		// collected in the same cycle rather than an hour later.
+		if files, freed, err := s.artifacts.prune(ctx, s.st.RunExists); err != nil {
+			s.log.Error("pruning artifacts of expired runs failed", "err", err)
+		} else if files > 0 {
+			s.log.Info("pruned artifacts of expired runs", "runs", files, "freed_mb", freed>>20)
+		}
 		// Deliveries live on a much shorter clock: GitHub will not redeliver a
 		// week-old event, so remembering it buys nothing.
 		if _, err := s.st.PruneDeliveries(ctx, 7*24*time.Hour); err != nil {

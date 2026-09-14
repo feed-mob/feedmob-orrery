@@ -52,3 +52,12 @@ func (s *Store) PruneDeliveries(ctx context.Context, age time.Duration) (int64, 
 	}
 	return res.RowsAffected()
 }
+
+// RunExists reports whether a run row is still there. The shared artifact store
+// uses it to find directories whose run has been pruned: the run table is the
+// authority on what an artifact still belongs to.
+func (s *Store) RunExists(ctx context.Context, id int64) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE id = ?`, id).Scan(&n)
+	return n > 0, err
+}

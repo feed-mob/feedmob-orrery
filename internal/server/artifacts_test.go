@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -120,3 +123,78 @@ func bearerReq(tok string) *http.Request {
 	r.Header.Set("Authorization", "Bearer "+tok)
 	return r
 }
+
+func TestArtifactPruneRemovesOnlyDeadRuns(t *testing.T) {
+	// Retention deletes run rows; before this, their files stayed on disk for
+	// good. On a control plane sharing a disk with anything else that is the
+	// same unbounded-growth failure the cache cap exists to prevent.
+	dir := t.TempDir()
+	a, err := NewArtifactStore(dir, "127.0.0.1:1", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new artifact store: %v", err)
+	}
+	t.Cleanup(a.Close)
+
+	write := func(run, name string, size int) {
+		t.Helper()
+		p := filepath.Join(dir, run, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("7", "build/out.bin", 2048) // run still exists
+	write("8", "build/out.bin", 4096) // run was pruned
+	// Not a run id at all — it did not come from the protocol, so it is left
+	// alone rather than guessed at.
+	write("notes", "readme.txt", 10)
+
+	removed, freed, err := a.prune(context.Background(), func(_ context.Context, id int64) (bool, error) {
+		return id == 7, nil
+	})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed %d runs, want 1", removed)
+	}
+	if freed < 4096 {
+		t.Errorf("freed %d bytes, want at least 4096", freed)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "7")); err != nil {
+		t.Error("the artifacts of a live run were deleted")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "8")); !os.IsNotExist(err) {
+		t.Error("the artifacts of a pruned run survived")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "notes")); err != nil {
+		t.Error("a directory that is not a run id was deleted")
+	}
+}
+
+func TestArtifactPruneStopsOnAFailedLookup(t *testing.T) {
+	// If the database cannot answer, deleting is a guess. Stop instead — the
+	// next cycle is an hour away and the files are not going anywhere.
+	dir := t.TempDir()
+	a, err := NewArtifactStore(dir, "127.0.0.1:1", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new artifact store: %v", err)
+	}
+	t.Cleanup(a.Close)
+	if err := os.MkdirAll(filepath.Join(dir, "9"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := a.prune(context.Background(), func(context.Context, int64) (bool, error) {
+		return false, errDB
+	}); err == nil {
+		t.Fatal("prune swallowed a database error")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "9")); err != nil {
+		t.Fatal("artifacts were deleted on the strength of a failed lookup")
+	}
+}
+
+var errDB = errors.New("database unavailable")
